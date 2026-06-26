@@ -61,8 +61,10 @@ async function startServer() {
         }
 
         try {
-          // Resolve relative URLs to absolute
-          const absoluteUrl = new URL(href, url).href;
+          // Resolve relative URLs to absolute and strip fragment/hash identifier
+          const urlObj = new URL(href, url);
+          urlObj.hash = "";
+          const absoluteUrl = urlObj.href;
 
           // Deduplicate urls
           if (!seenUrls.has(absoluteUrl)) {

@@ -1,0 +1,6 @@
+{
+  "name": "NotebookLM Länksamlare",
+  "description": "Extraherar, analyserar och kategoriserar användbara länkar från valfri webbplats för enkel inkopiering till NotebookLM.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from "react";
-import { Copy, Dna, Search, Link as LinkIcon, CheckCircle2, FileText, ChevronDown, ChevronRight, Download, Bot, Filter, Layers } from "lucide-react";
+import { Copy, Dna, Search, Link as LinkIcon, CheckCircle2, FileText, ChevronDown, ChevronRight, Download, Bot, Filter, Layers, Volume2, VolumeX, ArrowRight, Sparkles, Mic, MessageSquare, ExternalLink } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "./lib/utils";
 
@@ -18,13 +18,22 @@ interface Category {
   links: LinkItem[];
 }
 
+const defaultUrl = "https://www.churchofjesuschrist.org/study/manual/general-handbook?lang=eng";
+
 export default function App() {
-  const [url, setUrl] = useState("https://ai.google.dev/api");
+  const [url, setUrl] = useState(defaultUrl);
   
   // Scanning state
   const [scanLoading, setScanLoading] = useState(false);
   const [rawLinks, setRawLinks] = useState<BasicLink[]>([]);
   const [scanned, setScanned] = useState(false);
+  
+  // Audio / Discussion Leader State
+  const [guideStep, setGuideStep] = useState(0); // 0 = Inte startat, 1-4 = Steg
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [customReply, setCustomReply] = useState("");
+  const [chatLog, setChatLog] = useState<{ sender: "leader" | "user"; text: string; timestamp: Date }[]>([]);
+
   
   // Analysis state
   const [aiLoading, setAiLoading] = useState(false);
@@ -47,9 +56,71 @@ export default function App() {
   const [aiFiltering, setAiFiltering] = useState(false);
   const [aiFilteredUrls, setAiFilteredUrls] = useState<Set<string> | null>(null);
 
+  // Discussion leader voice assistant helper
+  const speakStep = (stepNum: number, overrideText?: string) => {
+    if (!('speechSynthesis' in window)) return;
+    
+    // Cancel active speech
+    window.speechSynthesis.cancel();
+    
+    const textToSpeak = overrideText || (
+      stepNum === 1 ? "Välkommen! Jag har samlat in och automatiskt kopierat alla rekommenderade källor till ditt urklipp. Klicka på knappen 'Öppna NotebookLM' för att öppna verktyget. Väl där inne, klicka på 'Skapa ny notebook' eller plustecknet." :
+      stepNum === 2 ? "Perfekt! Välj nu fliken 'Webbplats' i NotebookLM. Klistra sedan in länkarna från ditt urklipp genom att trycka på Ctrl+V eller Cmd+V och klicka på 'Infoga'. Svara mig här i chatten när du är klar så fortsätter vi!" :
+      stepNum === 3 ? "Härligt! Nu är din handbok laddad i din Notebook. Nu kan du ställa frågor i chatten nere till höger, till exempel 'Vad säger handboken om stöd till familjer?'. Prova att chatta en stund och svara mig sedan när du vill gå vidare!" :
+      stepNum === 4 ? "Slutligen, låt oss prata med handboken med röst! Klicka på knappen 'Öppna Gemini' för att gå till gemini.google.com. Där kan du trycka på mikrofonsymbolen för att börja prata med handboken på svenska. Använd mikrofonsymbolen för bäst resultat!" : ""
+    );
+    
+    if (!textToSpeak) return;
+
+    const utterance = new SpeechSynthesisUtterance(textToSpeak);
+    utterance.lang = "sv-SE";
+    
+    const voices = window.speechSynthesis.getVoices();
+    const svVoice = voices.find(v => v.lang.toLowerCase().startsWith("sv"));
+    if (svVoice) {
+      utterance.voice = svVoice;
+    }
+    
+    setIsSpeaking(true);
+    utterance.onend = () => setIsSpeaking(false);
+    utterance.onerror = () => setIsSpeaking(false);
+    
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const handleUserResponse = (text: string) => {
+    if (!text.trim()) return;
+    
+    const newUserMsg = { sender: "user" as const, text, timestamp: new Date() };
+    setChatLog(prev => [...prev, newUserMsg]);
+    
+    // Advance step
+    let nextStep = guideStep + 1;
+    if (nextStep > 4) nextStep = 4;
+    setGuideStep(nextStep);
+    
+    let leaderText = "";
+    if (nextStep === 2) {
+      leaderText = "Härligt att du har skapat notebooken! Välj nu fliken 'Webbplats' (Website). Klistra sedan in länkarna från ditt urklipp (Ctrl+V eller Cmd+V) och klicka på 'Infoga' (Insert).";
+    } else if (nextStep === 3) {
+      leaderText = "Snyggt jobbat! Nu är din handbok laddad i din Notebook. Prova gärna att chatta i fältet nere till höger, till exempel 'Vad säger handboken om stöd till familjer?'.";
+    } else if (nextStep === 4) {
+      leaderText = "Toppen! Nu öppnar vi Gemini (gemini.google.com) så att du kan börja prata med handboken på svenska. Tryck på mikrofonsymbolen för att prata direkt med röst (mikrofonen ger bäst resultat).";
+    } else {
+      leaderText = "Jag är här för att hjälpa dig! Låt mig veta om du vill att jag upprepar instruktionerna.";
+    }
+    
+    setTimeout(() => {
+      setChatLog(prev => [...prev, { sender: "leader", text: leaderText, timestamp: new Date() }]);
+      speakStep(nextStep, leaderText);
+    }, 600);
+    
+    setCustomReply("");
+  };
+
   const handleScan = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!url) return;
+    const scanUrl = url.trim() || defaultUrl;
     
     setScanLoading(true);
     setError("");
@@ -67,7 +138,7 @@ export default function App() {
       const response = await fetch("/api/extract-links", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url: scanUrl }),
       });
       
       if (response.ok) {
@@ -80,7 +151,7 @@ export default function App() {
       // Second attempt: Fallback to client-side fetching via CORS proxy for Netlify deployment
       console.log("Local backend failed/unavailable, trying client-side CORS proxy...", err);
       try {
-        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+        const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(scanUrl)}`;
         const response = await fetch(proxyUrl);
         if (!response.ok) {
           throw new Error("CORS-proxy misslyckades.");
@@ -97,7 +168,7 @@ export default function App() {
           const href = a.getAttribute("href");
           if (!href) return;
           try {
-            const urlObj = new URL(href, url);
+            const urlObj = new URL(href, scanUrl);
             urlObj.hash = ""; // Strip fragment/hash
             const absoluteUrl = urlObj.href;
             const text = a.textContent?.trim() || "";
@@ -120,6 +191,41 @@ export default function App() {
       setRawLinks(links);
       setScanned(true);
       handleManualCategorize(links);
+
+      // Attempt automatic copying of NotebookLM links to the clipboard
+      try {
+        const baseDomain = new URL(scanUrl).hostname;
+        const processed = links.map(link => {
+          const lowerUrl = link.url.toLowerCase();
+          const lowerText = link.text.toLowerCase();
+          const isIdeal = 
+            lowerUrl.includes('doc') || lowerUrl.includes('api') || lowerUrl.includes('guide') ||
+            lowerUrl.includes('tutorial') || lowerUrl.includes('article') || lowerUrl.includes('blog') ||
+            lowerText.includes('doc') || lowerText.includes('api') || lowerText.includes('guide') ||
+            lowerText.includes('tutorial') || lowerText.includes('manual');
+          return { ...link, isIdealForNotebookLM: isIdeal };
+        });
+        
+        const autoLinks = onlyNotebookLM 
+          ? processed.filter(l => l.isIdealForNotebookLM).map(l => l.url)
+          : processed.map(l => l.url);
+          
+        if (autoLinks.length > 0) {
+          await navigator.clipboard.writeText(autoLinks.join("\n"));
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        }
+      } catch (copyErr) {
+        console.warn("Auto clipboard copy failed, likely due to iframe permissions", copyErr);
+      }
+
+      // Start Step 1 of Discussion Leader Guidance
+      setGuideStep(1);
+      const welcomeText = "Välkommen! Jag har samlat in och automatiskt kopierat alla rekommenderade källor till ditt urklipp. Klicka på knappen 'Öppna NotebookLM' för att öppna verktyget. Väl där inne, klicka på 'Skapa ny notebook' eller plustecknet.";
+      setChatLog([
+        { sender: "leader", text: welcomeText, timestamp: new Date() }
+      ]);
+      speakStep(1, welcomeText);
     } else {
       setError("Inga länkar hittades på den angivna sidan.");
     }
@@ -701,23 +807,213 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                 </div>
               </div>
 
-              {/* Right Column: NotebookLM Export */}
-              <div className="flex-[2] flex flex-col gap-4 overflow-hidden">
+              {/* Right Column: Guide & NotebookLM Export */}
+              <div className="flex-[2] flex flex-col gap-4 overflow-y-auto pr-1 hide-scrollbar">
+                
+                {/* Röst-Diskussionsledare (Interactive Guide) */}
+                <div className="bg-gradient-to-br from-blue-50 to-indigo-50/50 border border-blue-100 rounded-xl p-4 shadow-sm flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white relative">
+                        <Mic size={16} />
+                        {isSpeaking && (
+                          <span className="absolute inset-0 rounded-full bg-blue-500 animate-ping opacity-75"></span>
+                        )}
+                      </div>
+                      <div>
+                        <h3 className="font-bold text-slate-800 text-xs uppercase tracking-wider">AI Diskussionsledare</h3>
+                        <p className="text-[10px] text-slate-500 font-medium">Interaktiv Röst & Steg-för-steg</p>
+                      </div>
+                    </div>
+                    
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => speakStep(guideStep || 1)}
+                        className={cn(
+                          "p-1.5 rounded-full transition-colors",
+                          isSpeaking ? "bg-blue-200/50 text-blue-700 animate-pulse" : "bg-slate-200/50 text-slate-600 hover:bg-slate-200"
+                        )}
+                        title="Spela upp röstinstruktion igen"
+                      >
+                        <Volume2 size={15} />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Step Progress indicators */}
+                  <div className="grid grid-cols-4 gap-1.5 py-1">
+                    {[
+                      { id: 1, label: "Skapa" },
+                      { id: 2, label: "Klistra in" },
+                      { id: 3, label: "Chatta" },
+                      { id: 4, label: "Gemini Röst" }
+                    ].map((step) => {
+                      const isActive = guideStep === step.id;
+                      const isCompleted = guideStep > step.id;
+                      return (
+                        <div key={step.id} className="flex flex-col gap-1">
+                          <div
+                            className={cn(
+                              "h-1.5 rounded-full transition-all duration-300",
+                              isCompleted ? "bg-emerald-500" :
+                              isActive ? "bg-blue-600 w-full animate-pulse" : "bg-slate-200"
+                            )}
+                          />
+                          <span className={cn(
+                            "text-[9px] font-bold text-center truncate",
+                            isActive ? "text-blue-600 font-extrabold" :
+                            isCompleted ? "text-emerald-600" : "text-slate-400"
+                          )}>
+                            {step.id}. {step.label}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Speech Bubble / Chat Area */}
+                  <div className="bg-white rounded-lg p-3 border border-blue-50 text-xs text-slate-700 shadow-sm leading-relaxed max-h-48 overflow-y-auto flex flex-col gap-2.5">
+                    {chatLog.length === 0 ? (
+                      <p className="text-slate-400 italic text-center py-4">Klicka på "1. HÄMTA LÄNKAR" till vänster för att starta diskussionsledaren och kopiera källorna automatiskt till ditt urklipp.</p>
+                    ) : (
+                      chatLog.map((msg, idx) => (
+                        <div
+                          key={idx}
+                          className={cn(
+                            "flex flex-col max-w-[85%] rounded-lg p-2.5",
+                            msg.sender === "leader" 
+                              ? "bg-blue-50/50 text-slate-800 self-start border border-blue-100/30 rounded-tl-none" 
+                              : "bg-indigo-600 text-white self-end rounded-tr-none"
+                          )}
+                        >
+                          <span className="text-[9px] opacity-60 font-bold mb-0.5 uppercase tracking-wider">
+                            {msg.sender === "leader" ? "Diskussionsledare" : "Du"}
+                          </span>
+                          <p className="text-[11.5px] leading-relaxed whitespace-pre-line">{msg.text}</p>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  {/* Interactive Quick Answers / Action Row */}
+                  {guideStep > 0 && (
+                    <div className="flex flex-col gap-2">
+                      <p className="text-[10px] font-semibold text-slate-500">Välj ditt svar till ledaren:</p>
+                      <div className="flex flex-col gap-1.5">
+                        {guideStep === 1 && (
+                          <button
+                            type="button"
+                            onClick={() => handleUserResponse("Jag har öppnat NotebookLM och skapat en ny notebook!")}
+                            className="bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold p-2 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm"
+                          >
+                            <span>1. Jag har skapat notebooken</span>
+                            <ArrowRight size={12} className="text-slate-400 group-hover:translate-x-0.5 transition-transform" />
+                          </button>
+                        )}
+                        {guideStep === 2 && (
+                          <button
+                            type="button"
+                            onClick={() => handleUserResponse("Jag har valt webbplatsfliken, klistrat in länkarna och klickat på infoga!")}
+                            className="bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold p-2 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm"
+                          >
+                            <span>2. Länkarna är inklistrade & infogade!</span>
+                            <ArrowRight size={12} className="text-slate-400 group-hover:translate-x-0.5 transition-transform" />
+                          </button>
+                        )}
+                        {guideStep === 3 && (
+                          <button
+                            type="button"
+                            onClick={() => handleUserResponse("Jag har testat att chatta med handboken och det fungerar utmärkt!")}
+                            className="bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold p-2 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm"
+                          >
+                            <span>3. Jag har testat chatta i NotebookLM</span>
+                            <ArrowRight size={12} className="text-slate-400 group-hover:translate-x-0.5 transition-transform" />
+                          </button>
+                        )}
+                        {guideStep === 4 && (
+                          <div className="bg-emerald-50 border border-emerald-100 text-emerald-800 text-[10.5px] font-semibold p-2.5 rounded-lg text-center flex flex-col items-center gap-1">
+                            <Sparkles size={14} className="text-emerald-600 animate-pulse" />
+                            <span>Guiden avslutad! Nu kan du ha fantastiska röstsamtal i Gemini.</span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setGuideStep(1);
+                                speakStep(1);
+                              }}
+                              className="text-[9.5px] text-blue-600 hover:underline mt-1 font-bold uppercase tracking-wider"
+                            >
+                              Börja om guiden
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Custom input response box */}
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            if (customReply.trim()) handleUserResponse(customReply);
+                          }}
+                          className="flex gap-1.5 mt-1"
+                        >
+                          <input
+                            type="text"
+                            value={customReply}
+                            onChange={(e) => setCustomReply(e.target.value)}
+                            placeholder="Skriv ett eget svar till ledaren..."
+                            className="flex-1 bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                          />
+                          <button
+                            type="submit"
+                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-3 py-1 rounded-lg text-xs"
+                          >
+                            Svara
+                          </button>
+                        </form>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* External quick-open buttons */}
+                  <div className="grid grid-cols-2 gap-2 mt-1">
+                    <a
+                      href="https://notebooklm.google.com/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="bg-[#1a73e8] hover:bg-[#1557b0] text-white text-[11px] font-bold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-all text-center"
+                    >
+                      <span>Öppna NotebookLM</span>
+                      <ExternalLink size={12} />
+                    </a>
+                    <a
+                      href="https://gemini.google.com/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:opacity-95 text-white text-[11px] font-bold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-all text-center"
+                    >
+                      <span>Öppna Gemini</span>
+                      <ExternalLink size={12} />
+                    </a>
+                  </div>
+                </div>
+
+                {/* NotebookLM Export Container */}
+                <div className="flex-1 bg-white border border-slate-200 rounded-xl p-4 flex flex-col gap-3 shadow-sm min-h-[220px]">
                   <div className="flex flex-col gap-2 shrink-0">
                     <div className="flex items-center justify-between">
-                      <h2 className="font-bold text-slate-800">NotebookLM Export</h2>
-                      <span className="text-[10px] font-medium text-slate-500">
-                        ({notebookLmLinks.length} st rader)
+                      <h2 className="font-bold text-slate-800 text-xs uppercase tracking-wider">NotebookLM Export</h2>
+                      <span className="text-[10px] font-semibold text-slate-500">
+                        ({notebookLmLinks.length} rader)
                       </span>
                     </div>
 
                     {/* Segmented export option toggle */}
-                    <div className="grid grid-cols-2 bg-slate-200/60 p-0.5 rounded-lg text-center text-xs font-semibold select-none">
+                    <div className="grid grid-cols-2 bg-slate-100 p-0.5 rounded-lg text-center text-[10.5px] font-bold select-none">
                       <button
                         type="button"
                         onClick={() => setOnlyNotebookLM(true)}
                         className={cn(
-                          "py-1.5 rounded-md transition-all",
+                          "py-1 rounded-md transition-all",
                           onlyNotebookLM 
                             ? "bg-white text-slate-800 shadow-sm" 
                             : "text-slate-500 hover:text-slate-800"
@@ -729,7 +1025,7 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                         type="button"
                         onClick={() => setOnlyNotebookLM(false)}
                         className={cn(
-                          "py-1.5 rounded-md transition-all",
+                          "py-1 rounded-md transition-all",
                           !onlyNotebookLM 
                             ? "bg-white text-slate-800 shadow-sm" 
                             : "text-slate-500 hover:text-slate-800"
@@ -740,7 +1036,7 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                     </div>
                   </div>
                   
-                  <div className="flex-1 bg-slate-900 rounded-lg p-4 font-mono text-[11px] text-emerald-400 overflow-y-auto leading-relaxed hide-scrollbar border border-slate-800 shadow-inner">
+                  <div className="flex-1 bg-slate-900 rounded-lg p-3.5 font-mono text-[10.5px] text-emerald-400 overflow-y-auto leading-relaxed hide-scrollbar border border-slate-800 shadow-inner">
                       {categories ? (
                         <pre className="whitespace-pre-wrap break-all select-all">
                           {notebookLmLinks.length > 0 
@@ -748,9 +1044,9 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                             : "// Inga matchande källor. Justera filter eller sökning."}
                         </pre>
                       ) : (
-                        <div className="h-full flex flex-col items-center justify-center opacity-50 text-slate-400 space-y-3 p-4 text-center">
-                          <Layers size={24} />
-                          <p>Kör autogruppering för att plocka ut de bästa dokumentationslänkarna för NotebookLM.</p>
+                        <div className="h-full flex flex-col items-center justify-center opacity-50 text-slate-400 space-y-2 p-4 text-center">
+                          <Layers size={20} />
+                          <p className="text-[11px]">Kör autogruppering för att plocka ut de bästa dokumentationslänkarna för NotebookLM.</p>
                         </div>
                       )}
                   </div>
@@ -760,7 +1056,7 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                         onClick={handleCopy}
                         disabled={notebookLmLinks.length === 0}
                         className={cn(
-                          "w-full font-bold py-3 text-xs rounded-lg flex items-center justify-center gap-2 shadow-sm transition-all active:scale-[0.98]",
+                          "w-full font-bold py-2.5 text-xs rounded-lg flex items-center justify-center gap-2 shadow-sm transition-all active:scale-[0.98]",
                           copied
                             ? "bg-emerald-600 text-white"
                             : "bg-slate-800 hover:bg-slate-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
@@ -768,17 +1064,19 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                       >
                         {copied ? (
                           <>
-                            <CheckCircle2 size={16} />
+                            <CheckCircle2 size={15} />
                             <span>KOPIERAT FÖR NOTEBOOKLM</span>
                           </>
                         ) : (
                           <>
-                            <Copy size={16} />
+                            <Copy size={15} />
                             <span>KOPIERA KÄLLOR</span>
                           </>
                         )}
                       </button>
                   </div>
+                </div>
+
               </div>
 
             </motion.section>

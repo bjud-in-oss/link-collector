@@ -1,5 +1,5 @@
-import React, { useState, useMemo } from "react";
-import { Copy, Dna, Search, Link as LinkIcon, CheckCircle2, FileText, ChevronDown, ChevronRight, Download, Bot, Filter, Layers, Volume2, VolumeX, ArrowRight, Sparkles, Mic, MessageSquare, ExternalLink } from "lucide-react";
+import React, { useState, useMemo, useRef, useEffect } from "react";
+import { Copy, Dna, Search, Link as LinkIcon, CheckCircle2, FileText, ChevronDown, ChevronRight, Download, Bot, Filter, Layers, Volume2, VolumeX, ArrowRight, Sparkles, Mic, MicOff, MessageSquare, ExternalLink, Key, Settings, User } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "./lib/utils";
 
@@ -31,6 +31,7 @@ export default function App() {
   // Audio / Discussion Leader State
   const [guideStep, setGuideStep] = useState(0); // 0 = Inte startat, 1-4 = Steg
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isListening, setIsListening] = useState(false);
   const [customReply, setCustomReply] = useState("");
   const [chatLog, setChatLog] = useState<{ sender: "leader" | "user"; text: string; timestamp: Date }[]>([]);
 
@@ -50,11 +51,68 @@ export default function App() {
   const [filterCategory, setFilterCategory] = useState("");
 
   // New configurations
-  const [apiKey, setApiKey] = useState("");
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("gemini_api_key") || "");
   const [onlyNotebookLM, setOnlyNotebookLM] = useState(true);
   const [aiSearchQuery, setAiSearchQuery] = useState("");
   const [aiFiltering, setAiFiltering] = useState(false);
   const [aiFilteredUrls, setAiFilteredUrls] = useState<Set<string> | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [exportDrawerOpen, setExportDrawerOpen] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Auto scroll to bottom of chat log
+  useEffect(() => {
+    if (chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatLog]);
+
+  // Speech-to-Text Voice input method
+  const startVoiceListening = () => {
+    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+      setError("Röstigenkänning stöds tyvärr inte i din webbläsare. Använd gärna Google Chrome för bäst resultat.");
+      return;
+    }
+
+    // Cancel active speech so it doesn't listen to itself
+    if (isSpeaking) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+    }
+
+    try {
+      const SpeechObj = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      const recognition = new SpeechObj();
+      recognition.lang = "sv-SE";
+      recognition.continuous = false;
+      recognition.interimResults = false;
+
+      recognition.onstart = () => {
+        setIsListening(true);
+      };
+
+      recognition.onerror = (event: any) => {
+        console.error("Speech recognition error", event);
+        setIsListening(false);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognition.onresult = (event: any) => {
+        const transcript = event.results[0][0].transcript;
+        if (transcript) {
+          handleUserResponse(transcript);
+        }
+      };
+
+      recognition.start();
+    } catch (e) {
+      console.error(e);
+      setIsListening(false);
+    }
+  };
 
   // Discussion leader voice assistant helper
   const speakStep = (stepNum: number, overrideText?: string) => {
@@ -94,25 +152,88 @@ export default function App() {
     const newUserMsg = { sender: "user" as const, text, timestamp: new Date() };
     setChatLog(prev => [...prev, newUserMsg]);
     
-    // Advance step
-    let nextStep = guideStep + 1;
-    if (nextStep > 4) nextStep = 4;
-    setGuideStep(nextStep);
-    
     let leaderText = "";
-    if (nextStep === 2) {
-      leaderText = "Härligt att du har skapat notebooken! Välj nu fliken 'Webbplats' (Website). Klistra sedan in länkarna från ditt urklipp (Ctrl+V eller Cmd+V) och klicka på 'Infoga' (Insert).";
-    } else if (nextStep === 3) {
-      leaderText = "Snyggt jobbat! Nu är din handbok laddad i din Notebook. Prova gärna att chatta i fältet nere till höger, till exempel 'Vad säger handboken om stöd till familjer?'.";
-    } else if (nextStep === 4) {
-      leaderText = "Toppen! Nu öppnar vi Gemini (gemini.google.com) så att du kan börja prata med handboken på svenska. Tryck på mikrofonsymbolen för att prata direkt med röst (mikrofonen ger bäst resultat).";
-    } else {
-      leaderText = "Jag är här för att hjälpa dig! Låt mig veta om du vill att jag upprepar instruktionerna.";
+    const lowerText = text.toLowerCase().trim();
+
+    // 1. Detect pasted Gemini API Key
+    const apiKeyMatch = text.match(/(AIzaSy[A-Za-z0-9_-]{35})/);
+    if (apiKeyMatch) {
+      const extractedKey = apiKeyMatch[1];
+      setApiKey(extractedKey);
+      localStorage.setItem("gemini_api_key", extractedKey);
+      leaderText = "Tack! Jag har lagt till din Gemini API-nyckel och sparat den säkert lokalt i din webbläsare. Nu kan vi använda avancerad AI-sökning och Gemini Live-röstfiltrering direkt i appen!";
+      setTimeout(() => {
+        setChatLog(prev => [...prev, { sender: "leader", text: leaderText, timestamp: new Date() }]);
+        speakStep(guideStep, leaderText);
+      }, 600);
+      setCustomReply("");
+      return;
+    }
+
+    // 2. Local filter / voice command parsing
+    let isFilterCommand = false;
+    if (lowerText.includes("ta bort") || lowerText.includes("exkludera") || lowerText.includes("filtrera bort") || lowerText.includes("göm") || lowerText.includes("dölj")) {
+      isFilterCommand = true;
+      const cleanTerm = lowerText
+        .replace("ta bort", "")
+        .replace("filtrera bort", "")
+        .replace("exkludera", "")
+        .replace("göm", "")
+        .replace("dölj", "")
+        .replace("länk", "")
+        .replace("länkar", "")
+        .replace("med", "")
+        .trim();
+
+      if (cleanTerm) {
+        setFilterText(`-${cleanTerm}`);
+        leaderText = `Självklart! Jag har filtrerat bort källor som innehåller "${cleanTerm}". Listan har uppdaterats och kopierats till ditt urklipp!`;
+      } else {
+        leaderText = "Vad vill du ta bort? Säg till exempel: 'ta bort lathund' eller 'göm externa'.";
+      }
+    } else if (lowerText.includes("visa alla") || lowerText.includes("återställ") || lowerText.includes("nollställ") || lowerText.includes("ta bort filter")) {
+      isFilterCommand = true;
+      setFilterText("");
+      setAiFilteredUrls(null);
+      leaderText = "Jag har återställt alla filter. Nu ser du hela länklistan igen!";
+    } else if (lowerText.includes("visa bara") || lowerText.includes("behåll") || lowerText.includes("inkludera bara") || lowerText.includes("hitta")) {
+      isFilterCommand = true;
+      const cleanTerm = lowerText
+        .replace("visa bara", "")
+        .replace("behåll", "")
+        .replace("inkludera bara", "")
+        .replace("hitta", "")
+        .trim();
+
+      if (cleanTerm) {
+        setFilterText(cleanTerm);
+        leaderText = `Fixat! Jag visar nu endast källor som innehåller "${cleanTerm}". Länkarna har uppdaterats automatiskt.`;
+      } else {
+        leaderText = "Vad vill du visa? Säg till exempel: 'visa bara kapitel 5'.";
+      }
+    } else if (lowerText.includes("nyckel") || lowerText.includes("api") || lowerText.includes("studio") || lowerText.includes("hur hämtar")) {
+      leaderText = "För att hämta din kostnadsfria Gemini API-nyckel:\n1. Gå till https://aistudio.google.com/\n2. Klicka på 'Get API key' längst upp till vänster.\n3. Skapa en nyckel och kopiera den.\n4. Klistra in den direkt här i vår chat så sparar jag den åt dig direkt!";
+    }
+
+    // Standard steps progress if not a filter/api instruction
+    if (!leaderText) {
+      const nextStep = guideStep + 1 > 4 ? 4 : guideStep + 1;
+      setGuideStep(nextStep);
+      
+      if (nextStep === 2) {
+        leaderText = "Härligt att du har skapat notebooken! Välj nu fliken 'Webbplats' (Website). Klistra sedan in länkarna från ditt urklipp (Ctrl+V eller Cmd+V) och klicka på 'Infoga' (Insert). Säg till mig när du är klar!";
+      } else if (nextStep === 3) {
+        leaderText = "Snyggt jobbat! Nu är din handbok laddad i din Notebook. Prova gärna att chatta i fältet nere till höger, till exempel 'Vad säger handboken om stöd till familjer?'. Berätta hur det går!";
+      } else if (nextStep === 4) {
+        leaderText = "Toppen! Nu öppnar vi Gemini (gemini.google.com) så att du kan börja prata med handboken med Gemini Live på svenska. Tryck på mikrofonsymbolen längst ner till höger i Gemini för att prata direkt med röst (mikrofonen ger bäst resultat).";
+      } else {
+        leaderText = "Jag är här för att leda dig! Säg till om du vill att jag återställer guiden eller filterinställningarna.";
+      }
     }
     
     setTimeout(() => {
       setChatLog(prev => [...prev, { sender: "leader", text: leaderText, timestamp: new Date() }]);
-      speakStep(nextStep, leaderText);
+      speakStep(guideStep, leaderText);
     }, 600);
     
     setCustomReply("");
@@ -553,84 +674,170 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
             </button>
           </form>
 
-          {/* Filters (only show if we have raw links) */}
-          {/* Filters & AI Search (only show if we have raw links) */}
+          {/* Quick open and autogrouping helper buttons */}
           {scanned && (
-            <div className="flex flex-col gap-3 pt-3 border-t border-slate-100">
-              <div className="flex flex-col md:flex-row gap-3">
-                <div className="relative flex-1">
-                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <Filter className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                  <input
-                    type="text"
-                    value={filterText}
-                    onChange={(e) => setFilterText(e.target.value)}
-                    placeholder="Filtrera på nyckelord eller URL..."
-                    className="w-full bg-slate-50 border border-slate-200 rounded-md py-1.5 pl-8 pr-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                  />
-                </div>
-                <select
-                  value={filterDomain}
-                  onChange={(e) => setFilterDomain(e.target.value)}
-                  className="bg-slate-50 border border-slate-200 rounded-md py-1.5 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20 w-full md:w-48 appearance-none"
+            <div className="flex flex-col sm:flex-row gap-3 pt-1">
+              <a
+                href="https://notebooklm.google.com/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="bg-[#1a73e8] hover:bg-[#1557b0] text-white text-xs font-bold py-2.5 px-6 rounded-lg shadow-sm transition-all active:scale-[0.99] flex items-center justify-center gap-2 flex-1 text-center"
+              >
+                <ExternalLink size={14} />
+                <span>2. ÖPPNA NOTEBOOKLM</span>
+              </a>
+              {rawLinks.length > 0 && !categories && (
+                <button
+                  type="button"
+                  onClick={() => handleAnalyze()}
+                  disabled={aiLoading}
+                  className="bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold py-2.5 px-6 rounded-lg shadow-sm transition-all active:scale-[0.99] flex items-center justify-center gap-2"
                 >
-                  <option value="">Alla domäner</option>
-                  {uniqueDomains.map(d => <option key={d} value={d}>{d}</option>)}
-                </select>
-                
-                {categories && (
-                  <select
-                    value={filterCategory}
-                    onChange={(e) => setFilterCategory(e.target.value)}
-                    className="bg-slate-50 border border-slate-200 rounded-md py-1.5 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20 w-full md:w-48 appearance-none"
-                  >
-                    <option value="">Alla kategorier</option>
-                    {availableCategories.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select>
-                )}
-              </div>
+                  <Bot size={14} />
+                  <span>KÖR AUTOGRUPPERING (REKOMMENDERAS)</span>
+                </button>
+              )}
+            </div>
+          )}
 
-              {/* AI Filter Search */}
-              <div className="flex flex-col md:flex-row gap-3 pt-2 border-t border-dashed border-slate-150">
-                <div className="relative flex-1">
-                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <Bot className="h-3.5 w-3.5 text-blue-500" />
-                  </div>
-                  <input
-                    type="text"
-                    value={aiSearchQuery}
-                    onChange={(e) => setAiSearchQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && aiSearchQuery.trim()) {
-                        e.preventDefault();
-                        handleAiSearch();
-                      }
-                    }}
-                    placeholder="Finsök med AI (t.ex. 'Hitta endast sidor relaterade till autentisering eller inställningar')..."
-                    className="w-full bg-blue-50/50 border border-blue-100 rounded-md py-1.5 pl-8 pr-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                  />
+          {/* Collapsible Custom Settings and Advanced Filters */}
+          {scanned && (
+            <div className="border border-slate-200 rounded-xl bg-slate-50/50 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(!settingsOpen)}
+                className="w-full flex items-center justify-between p-3 text-xs font-bold text-slate-700 hover:bg-slate-100/50 transition-colors select-none"
+              >
+                <div className="flex items-center gap-2">
+                  <Settings size={14} className="text-slate-500" />
+                  <span>ANPASSA APPEN & INSTÄLLNINGAR</span>
                 </div>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={handleAiSearch}
-                    disabled={aiFiltering || !aiSearchQuery.trim()}
-                    className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-1.5 rounded shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1 shrink-0"
-                  >
-                    {aiFiltering ? "SÖKER..." : "AI SÖKNING"}
-                  </button>
-                  {aiFilteredUrls && (
-                    <button
-                      type="button"
-                      onClick={handleResetAiSearch}
-                      className="bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs font-bold px-3 py-1.5 rounded transition-colors shrink-0"
-                    >
-                      ÅTERSTÄLL
-                    </button>
+                <div className="flex items-center gap-2">
+                  {apiKey ? (
+                    <span className="text-[9px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded font-bold uppercase">AI Aktiv</span>
+                  ) : (
+                    <span className="text-[9px] bg-slate-200 text-slate-600 px-1.5 py-0.5 rounded font-bold uppercase">Endast lokal</span>
                   )}
+                  {settingsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                 </div>
-              </div>
+              </button>
+
+              <AnimatePresence>
+                {settingsOpen && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: "auto", opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    className="border-t border-slate-200 bg-white p-4 flex flex-col gap-4 overflow-hidden"
+                  >
+                    {/* Manual inputs & Dropdowns */}
+                    <div className="flex flex-col md:flex-row gap-3">
+                      <div className="relative flex-1">
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                          <Filter className="h-3.5 w-3.5 text-slate-400" />
+                        </div>
+                        <input
+                          type="text"
+                          value={filterText}
+                          onChange={(e) => setFilterText(e.target.value)}
+                          placeholder="Filtrera på nyckelord eller URL (t.ex. '-lathund' eller 'kapitel')..."
+                          className="w-full bg-slate-50 border border-slate-200 rounded-md py-1.5 pl-8 pr-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                        />
+                      </div>
+                      <select
+                        value={filterDomain}
+                        onChange={(e) => setFilterDomain(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 rounded-md py-1.5 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20 w-full md:w-48 appearance-none"
+                      >
+                        <option value="">Alla domäner</option>
+                        {uniqueDomains.map(d => <option key={d} value={d}>{d}</option>)}
+                      </select>
+                      
+                      {categories && (
+                        <select
+                          value={filterCategory}
+                          onChange={(e) => setFilterCategory(e.target.value)}
+                          className="bg-slate-50 border border-slate-200 rounded-md py-1.5 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20 w-full md:w-48 appearance-none"
+                        >
+                          <option value="">Alla kategorier</option>
+                          {availableCategories.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                      )}
+                    </div>
+
+                    {/* AI Filter Search */}
+                    <div className="flex flex-col md:flex-row gap-3 pt-3 border-t border-dashed border-slate-150">
+                      <div className="relative flex-1">
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                          <Bot className="h-3.5 w-3.5 text-blue-500" />
+                        </div>
+                        <input
+                          type="text"
+                          value={aiSearchQuery}
+                          onChange={(e) => setAiSearchQuery(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && aiSearchQuery.trim()) {
+                              e.preventDefault();
+                              handleAiSearch();
+                            }
+                          }}
+                          placeholder="Finsök med AI (t.ex. 'Hitta endast sidor relaterade till autentisering')..."
+                          className="w-full bg-blue-50/50 border border-blue-100 rounded-md py-1.5 pl-8 pr-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                        />
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={handleAiSearch}
+                          disabled={aiFiltering || !aiSearchQuery.trim()}
+                          className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-1.5 rounded shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1 shrink-0"
+                        >
+                          {aiFiltering ? "SÖKER..." : "AI SÖKNING"}
+                        </button>
+                        {aiFilteredUrls && (
+                          <button
+                            type="button"
+                            onClick={handleResetAiSearch}
+                            className="bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs font-bold px-3 py-1.5 rounded transition-colors shrink-0"
+                          >
+                            ÅTERSTÄLL
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Gemini API Key input */}
+                    <div className="pt-3 border-t border-slate-150">
+                      <div className="flex flex-col gap-1.5">
+                        <label className="text-[11px] font-bold text-slate-600 flex items-center gap-1">
+                          <Key size={12} className="text-slate-400" />
+                          <span>Din Gemini API-nyckel</span>
+                        </label>
+                        <div className="flex gap-2">
+                          <input
+                            type="password"
+                            value={apiKey}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setApiKey(val);
+                              localStorage.setItem("gemini_api_key", val);
+                            }}
+                            placeholder="Klistra in din Gemini API-nyckel här..."
+                            className="flex-1 bg-slate-50 border border-slate-200 rounded-md py-1.5 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                          />
+                        </div>
+                        <p className="text-[10px] text-slate-400">
+                          För att använda röststyrning och Gemini Live-filtrering behöver du en kostnadsfri API-nyckel. Gå till{" "}
+                          <a href="https://aistudio.google.com/" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline font-bold">
+                            Google AI Studio
+                          </a>{" "}
+                          för att hämta din nyckel helt gratis. Du kan också klistra in nyckeln direkt i chatten!
+                        </p>
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
           )}
 
@@ -639,32 +846,6 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
               ⚠️ <span>{error}</span>
             </div>
           )}
-
-          {/* Setup for future AI functionality */}
-          <div className="mt-4 pt-4 border-t border-slate-100">
-            <details className="group" open={!apiKey}>
-              <summary className="text-xs font-semibold text-slate-500 cursor-pointer flex items-center gap-1.5 outline-none select-none">
-                <ChevronRight size={14} className="group-open:rotate-90 transition-transform" />
-                Gemini API-nyckel (Krävs för AI-sökning på Netlify)
-              </summary>
-              <div className="mt-3 pl-5">
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setApiKey(val);
-                    localStorage.setItem("gemini_api_key", val);
-                  }}
-                  placeholder="Klistra in din Gemini API-nyckel här..."
-                  className="w-full max-w-sm bg-slate-50 border border-slate-200 rounded-md py-1.5 px-3 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                />
-                <p className="text-[10px] text-slate-400 mt-1.5">
-                  Din nyckel sparas säkert lokalt i din webbläsare (localStorage) och skickas endast till Googles officiella Gemini API vid sökning. Det är helt kostnadsfritt under gratis-nivån för Gemini 2.5 Flash!
-                </p>
-              </div>
-            </details>
-          </div>
         </section>
 
         {/* Results Area */}
@@ -807,105 +988,143 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                 </div>
               </div>
 
-              {/* Right Column: Guide & NotebookLM Export */}
-              <div className="flex-[2] flex flex-col gap-4 overflow-y-auto pr-1 hide-scrollbar">
+              {/* Right Column: Unified AI Discussion Leader with Integrated Collapsible Export */}
+              <div className="flex-[2] flex flex-col bg-gradient-to-br from-blue-50 to-indigo-50/50 border border-blue-100 rounded-xl shadow-sm overflow-hidden h-full">
                 
-                {/* Röst-Diskussionsledare (Interactive Guide) */}
-                <div className="bg-gradient-to-br from-blue-50 to-indigo-50/50 border border-blue-100 rounded-xl p-4 shadow-sm flex flex-col gap-3">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white relative">
+                {/* Header of AI Discussion Leader */}
+                <div className="p-4 bg-white border-b border-blue-100 shrink-0 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white relative">
+                      {isListening ? (
+                        <Mic size={16} className="animate-pulse text-green-300" />
+                      ) : (
                         <Mic size={16} />
-                        {isSpeaking && (
-                          <span className="absolute inset-0 rounded-full bg-blue-500 animate-ping opacity-75"></span>
-                        )}
-                      </div>
-                      <div>
-                        <h3 className="font-bold text-slate-800 text-xs uppercase tracking-wider">AI Diskussionsledare</h3>
-                        <p className="text-[10px] text-slate-500 font-medium">Interaktiv Röst & Steg-för-steg</p>
-                      </div>
+                      )}
+                      {isSpeaking && (
+                        <span className="absolute inset-0 rounded-full bg-blue-500 animate-ping opacity-75"></span>
+                      )}
                     </div>
-                    
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => speakStep(guideStep || 1)}
-                        className={cn(
-                          "p-1.5 rounded-full transition-colors",
-                          isSpeaking ? "bg-blue-200/50 text-blue-700 animate-pulse" : "bg-slate-200/50 text-slate-600 hover:bg-slate-200"
+                    <div>
+                      <h3 className="font-bold text-slate-800 text-xs uppercase tracking-wider">AI Diskussionsledare</h3>
+                      <p className="text-[10px] text-slate-500 font-medium flex items-center gap-1">
+                        <span>Röststyrd & Steg-för-steg</span>
+                        {isListening && (
+                          <span className="text-green-600 font-bold animate-pulse text-[9px] uppercase">(Lyssnar...)</span>
                         )}
-                        title="Spela upp röstinstruktion igen"
-                      >
-                        <Volume2 size={15} />
-                      </button>
+                      </p>
                     </div>
                   </div>
-
-                  {/* Step Progress indicators */}
-                  <div className="grid grid-cols-4 gap-1.5 py-1">
-                    {[
-                      { id: 1, label: "Skapa" },
-                      { id: 2, label: "Klistra in" },
-                      { id: 3, label: "Chatta" },
-                      { id: 4, label: "Gemini Röst" }
-                    ].map((step) => {
-                      const isActive = guideStep === step.id;
-                      const isCompleted = guideStep > step.id;
-                      return (
-                        <div key={step.id} className="flex flex-col gap-1">
-                          <div
-                            className={cn(
-                              "h-1.5 rounded-full transition-all duration-300",
-                              isCompleted ? "bg-emerald-500" :
-                              isActive ? "bg-blue-600 w-full animate-pulse" : "bg-slate-200"
-                            )}
-                          />
-                          <span className={cn(
-                            "text-[9px] font-bold text-center truncate",
-                            isActive ? "text-blue-600 font-extrabold" :
-                            isCompleted ? "text-emerald-600" : "text-slate-400"
-                          )}>
-                            {step.id}. {step.label}
-                          </span>
-                        </div>
-                      );
-                    })}
+                  
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => startVoiceListening()}
+                      className={cn(
+                        "p-2 rounded-full transition-all duration-200",
+                        isListening 
+                          ? "bg-red-500 text-white shadow-md animate-bounce" 
+                          : "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                      )}
+                      title={isListening ? "Klicka för att stänga av mikrofonen" : "Klicka för att prata med diskussionsledaren (Gemini Live)"}
+                    >
+                      <Mic size={15} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => speakStep(guideStep || 1)}
+                      className={cn(
+                        "p-2 rounded-full transition-colors bg-slate-100 text-slate-600 hover:bg-slate-200",
+                        isSpeaking && "bg-blue-100 text-blue-700"
+                      )}
+                      title="Spela upp röstinstruktion igen"
+                    >
+                      <Volume2 size={15} />
+                    </button>
                   </div>
+                </div>
 
-                  {/* Speech Bubble / Chat Area */}
-                  <div className="bg-white rounded-lg p-3 border border-blue-50 text-xs text-slate-700 shadow-sm leading-relaxed max-h-48 overflow-y-auto flex flex-col gap-2.5">
-                    {chatLog.length === 0 ? (
-                      <p className="text-slate-400 italic text-center py-4">Klicka på "1. HÄMTA LÄNKAR" till vänster för att starta diskussionsledaren och kopiera källorna automatiskt till ditt urklipp.</p>
-                    ) : (
-                      chatLog.map((msg, idx) => (
+                {/* Step Progress indicators */}
+                <div className="grid grid-cols-4 gap-1.5 p-3 bg-white/50 border-b border-blue-100 shrink-0">
+                  {[
+                    { id: 1, label: "Skapa" },
+                    { id: 2, label: "Klistra in" },
+                    { id: 3, label: "Chatta" },
+                    { id: 4, label: "Gemini Röst" }
+                  ].map((step) => {
+                    const isActive = guideStep === step.id;
+                    const isCompleted = guideStep > step.id;
+                    return (
+                      <div key={step.id} className="flex flex-col gap-1">
                         <div
-                          key={idx}
                           className={cn(
-                            "flex flex-col max-w-[85%] rounded-lg p-2.5",
-                            msg.sender === "leader" 
-                              ? "bg-blue-50/50 text-slate-800 self-start border border-blue-100/30 rounded-tl-none" 
-                              : "bg-indigo-600 text-white self-end rounded-tr-none"
+                            "h-1 rounded-full transition-all duration-300",
+                            isCompleted ? "bg-emerald-500" :
+                            isActive ? "bg-blue-600 w-full animate-pulse" : "bg-slate-200"
                           )}
-                        >
-                          <span className="text-[9px] opacity-60 font-bold mb-0.5 uppercase tracking-wider">
-                            {msg.sender === "leader" ? "Diskussionsledare" : "Du"}
-                          </span>
-                          <p className="text-[11.5px] leading-relaxed whitespace-pre-line">{msg.text}</p>
-                        </div>
-                      ))
-                    )}
-                  </div>
+                        />
+                        <span className={cn(
+                          "text-[9px] font-bold text-center truncate",
+                          isActive ? "text-blue-600 font-extrabold" :
+                          isCompleted ? "text-emerald-600" : "text-slate-400"
+                        )}>
+                          {step.id}. {step.label}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
 
-                  {/* Interactive Quick Answers / Action Row */}
+                {/* Speech Bubble / Chat Area - FLEX GROW to fill entire column */}
+                <div className="flex-1 p-4 overflow-y-auto flex flex-col gap-3 min-h-0 bg-slate-50/40">
+                  {chatLog.length === 0 ? (
+                    <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-slate-400 space-y-3">
+                      <Bot size={36} className="text-slate-300 animate-bounce" />
+                      <p className="text-xs leading-relaxed max-w-[240px]">
+                        Klicka på <strong className="text-blue-600 font-bold">"1. HÄMTA LÄNKAR"</strong> till vänster för att starta diskussionsledaren och kopiera källorna automatiskt.
+                      </p>
+                    </div>
+                  ) : (
+                    chatLog.map((msg, idx) => (
+                      <div
+                        key={idx}
+                        className={cn(
+                          "flex flex-col max-w-[85%] rounded-xl p-3 shadow-sm",
+                          msg.sender === "leader" 
+                            ? "bg-white text-slate-800 self-start border border-blue-100/50 rounded-tl-none" 
+                            : "bg-blue-600 text-white self-end rounded-tr-none"
+                        )}
+                      >
+                        <span className="text-[9px] opacity-60 font-bold mb-1 uppercase tracking-wider flex items-center gap-1">
+                          {msg.sender === "leader" ? (
+                            <>
+                              <Bot size={10} />
+                              <span>Diskussionsledare</span>
+                            </>
+                          ) : (
+                            <>
+                              <User size={10} />
+                              <span>Du (Röst)</span>
+                            </>
+                          )}
+                        </span>
+                        <p className="text-[12px] leading-relaxed whitespace-pre-line font-medium">{msg.text}</p>
+                      </div>
+                    ))
+                  )}
+                  <div ref={chatEndRef} />
+                </div>
+
+                {/* Interactive Answers, Manual Input & Voice Assistant Bar */}
+                <div className="p-4 bg-white border-t border-blue-100 shrink-0 flex flex-col gap-3">
                   {guideStep > 0 && (
                     <div className="flex flex-col gap-2">
-                      <p className="text-[10px] font-semibold text-slate-500">Välj ditt svar till ledaren:</p>
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Föreslagna svar / Styrning:</p>
                       <div className="flex flex-col gap-1.5">
                         {guideStep === 1 && (
                           <button
                             type="button"
                             onClick={() => handleUserResponse("Jag har öppnat NotebookLM och skapat en ny notebook!")}
-                            className="bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold p-2 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm"
+                            className="bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold py-2 px-3 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm animate-pulse"
                           >
                             <span>1. Jag har skapat notebooken</span>
                             <ArrowRight size={12} className="text-slate-400 group-hover:translate-x-0.5 transition-transform" />
@@ -915,7 +1134,7 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                           <button
                             type="button"
                             onClick={() => handleUserResponse("Jag har valt webbplatsfliken, klistrat in länkarna och klickat på infoga!")}
-                            className="bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold p-2 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm"
+                            className="bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold py-2 px-3 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm animate-pulse"
                           >
                             <span>2. Länkarna är inklistrade & infogade!</span>
                             <ArrowRight size={12} className="text-slate-400 group-hover:translate-x-0.5 transition-transform" />
@@ -925,7 +1144,7 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                           <button
                             type="button"
                             onClick={() => handleUserResponse("Jag har testat att chatta med handboken och det fungerar utmärkt!")}
-                            className="bg-white hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold p-2 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm"
+                            className="bg-slate-50 hover:bg-blue-50 border border-slate-200 hover:border-blue-200 text-[11px] text-slate-700 font-semibold py-2 px-3 rounded-lg transition-all text-left flex items-center justify-between group shadow-sm animate-pulse"
                           >
                             <span>3. Jag har testat chatta i NotebookLM</span>
                             <ArrowRight size={12} className="text-slate-400 group-hover:translate-x-0.5 transition-transform" />
@@ -954,18 +1173,30 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                             e.preventDefault();
                             if (customReply.trim()) handleUserResponse(customReply);
                           }}
-                          className="flex gap-1.5 mt-1"
+                          className="flex gap-2 mt-1"
                         >
                           <input
                             type="text"
                             value={customReply}
                             onChange={(e) => setCustomReply(e.target.value)}
-                            placeholder="Skriv ett eget svar till ledaren..."
-                            className="flex-1 bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                            placeholder={isListening ? "Lyssnar på din röst..." : "Svara med text eller klicka på micken..."}
+                            className="flex-1 bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500/20"
                           />
                           <button
+                            type="button"
+                            onClick={() => startVoiceListening()}
+                            className={cn(
+                              "px-3 py-1.5 rounded-lg text-xs transition-colors border flex items-center justify-center",
+                              isListening 
+                                ? "bg-red-500 text-white border-red-500 animate-pulse" 
+                                : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"
+                            )}
+                          >
+                            {isListening ? "Stop" : <Mic size={14} />}
+                          </button>
+                          <button
                             type="submit"
-                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-3 py-1 rounded-lg text-xs"
+                            className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-4 py-1.5 rounded-lg text-xs shadow-sm transition-all"
                           >
                             Svara
                           </button>
@@ -991,92 +1222,106 @@ Din uppgift är att analysera länkarna och avgöra vilka som är relevanta för
                       rel="noopener noreferrer"
                       className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:opacity-95 text-white text-[11px] font-bold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 shadow-sm transition-all text-center"
                     >
-                      <span>Öppna Gemini</span>
+                      <span>Öppna Gemini Live</span>
                       <ExternalLink size={12} />
                     </a>
                   </div>
                 </div>
 
-                {/* NotebookLM Export Container */}
-                <div className="flex-1 bg-white border border-slate-200 rounded-xl p-4 flex flex-col gap-3 shadow-sm min-h-[220px]">
-                  <div className="flex flex-col gap-2 shrink-0">
-                    <div className="flex items-center justify-between">
-                      <h2 className="font-bold text-slate-800 text-xs uppercase tracking-wider">NotebookLM Export</h2>
-                      <span className="text-[10px] font-semibold text-slate-500">
-                        ({notebookLmLinks.length} rader)
+                {/* Collapsible NotebookLM Export Drawer at the very bottom */}
+                <div className="border-t border-blue-100 bg-white shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setExportDrawerOpen(!exportDrawerOpen)}
+                    className="w-full flex items-center justify-between px-4 py-3 bg-slate-50 hover:bg-slate-100/50 transition-colors select-none text-xs font-bold text-slate-700"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Layers size={14} className="text-blue-600" />
+                      <span>NOTEBOOKLM EXPORT & KÄLLOR</span>
+                      <span className="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full">
+                        {notebookLmLinks.length} st
                       </span>
                     </div>
+                    {exportDrawerOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  </button>
 
-                    {/* Segmented export option toggle */}
-                    <div className="grid grid-cols-2 bg-slate-100 p-0.5 rounded-lg text-center text-[10.5px] font-bold select-none">
-                      <button
-                        type="button"
-                        onClick={() => setOnlyNotebookLM(true)}
-                        className={cn(
-                          "py-1 rounded-md transition-all",
-                          onlyNotebookLM 
-                            ? "bg-white text-slate-800 shadow-sm" 
-                            : "text-slate-500 hover:text-slate-800"
-                        )}
+                  <AnimatePresence>
+                    {exportDrawerOpen && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: "auto", opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        className="p-4 bg-white flex flex-col gap-3 border-t border-slate-100 overflow-hidden"
                       >
-                        Rekommenderade
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setOnlyNotebookLM(false)}
-                        className={cn(
-                          "py-1 rounded-md transition-all",
-                          !onlyNotebookLM 
-                            ? "bg-white text-slate-800 shadow-sm" 
-                            : "text-slate-500 hover:text-slate-800"
-                        )}
-                      >
-                        Alla länkar
-                      </button>
-                    </div>
-                  </div>
-                  
-                  <div className="flex-1 bg-slate-900 rounded-lg p-3.5 font-mono text-[10.5px] text-emerald-400 overflow-y-auto leading-relaxed hide-scrollbar border border-slate-800 shadow-inner">
-                      {categories ? (
-                        <pre className="whitespace-pre-wrap break-all select-all">
-                          {notebookLmLinks.length > 0 
-                            ? notebookLmLinks.join("\n") 
-                            : "// Inga matchande källor. Justera filter eller sökning."}
-                        </pre>
-                      ) : (
-                        <div className="h-full flex flex-col items-center justify-center opacity-50 text-slate-400 space-y-2 p-4 text-center">
-                          <Layers size={20} />
-                          <p className="text-[11px]">Kör autogruppering för att plocka ut de bästa dokumentationslänkarna för NotebookLM.</p>
+                        {/* Segmented export option toggle */}
+                        <div className="grid grid-cols-2 bg-slate-100 p-0.5 rounded-lg text-center text-[10.5px] font-bold select-none">
+                          <button
+                            type="button"
+                            onClick={() => setOnlyNotebookLM(true)}
+                            className={cn(
+                              "py-1 rounded-md transition-all",
+                              onlyNotebookLM 
+                                ? "bg-white text-slate-800 shadow-sm" 
+                                : "text-slate-500 hover:text-slate-800"
+                            )}
+                          >
+                            Källor (Rekommenderas)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setOnlyNotebookLM(false)}
+                            className={cn(
+                              "py-1 rounded-md transition-all",
+                              !onlyNotebookLM 
+                                ? "bg-white text-slate-800 shadow-sm" 
+                                : "text-slate-500 hover:text-slate-800"
+                            )}
+                          >
+                            Alla funna länkar
+                          </button>
                         </div>
-                      )}
-                  </div>
-                  
-                  <div className="shrink-0">
-                      <button
-                        onClick={handleCopy}
-                        disabled={notebookLmLinks.length === 0}
-                        className={cn(
-                          "w-full font-bold py-2.5 text-xs rounded-lg flex items-center justify-center gap-2 shadow-sm transition-all active:scale-[0.98]",
-                          copied
-                            ? "bg-emerald-600 text-white"
-                            : "bg-slate-800 hover:bg-slate-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
-                        )}
-                      >
-                        {copied ? (
-                          <>
-                            <CheckCircle2 size={15} />
-                            <span>KOPIERAT FÖR NOTEBOOKLM</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy size={15} />
-                            <span>KOPIERA KÄLLOR</span>
-                          </>
-                        )}
-                      </button>
-                  </div>
-                </div>
 
+                        <div className="bg-slate-900 rounded-lg p-3 font-mono text-[10.5px] text-emerald-400 overflow-y-auto max-h-32 leading-relaxed border border-slate-800 shadow-inner">
+                          {categories ? (
+                            <pre className="whitespace-pre-wrap break-all select-all">
+                              {notebookLmLinks.length > 0 
+                                ? notebookLmLinks.join("\n") 
+                                : "// Inga matchande källor. Justera filter eller sökning."}
+                            </pre>
+                          ) : (
+                            <div className="h-full flex flex-col items-center justify-center opacity-50 text-slate-400 space-y-1 py-4 text-center">
+                              <Layers size={18} />
+                              <p className="text-[10px]">Kör autogruppering först för att filtrera optimala källor.</p>
+                            </div>
+                          )}
+                        </div>
+
+                        <button
+                          onClick={handleCopy}
+                          disabled={notebookLmLinks.length === 0}
+                          className={cn(
+                            "w-full font-bold py-2 text-xs rounded-lg flex items-center justify-center gap-2 shadow-sm transition-all active:scale-[0.98]",
+                            copied
+                              ? "bg-emerald-600 text-white"
+                              : "bg-slate-800 hover:bg-slate-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                          )}
+                        >
+                          {copied ? (
+                            <>
+                              <CheckCircle2 size={14} />
+                              <span>KOPIERAT TILL URKLIPP</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy size={14} />
+                              <span>KOPIERA KÄLLOR FÖR NOTEBOOKLM</span>
+                            </>
+                          )}
+                        </button>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
               </div>
 
             </motion.section>

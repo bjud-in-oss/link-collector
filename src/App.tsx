@@ -109,6 +109,22 @@ export default function App() {
   const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const speakingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
+  const isMutedRef = useRef(false);
+
+  const toggleMute = () => {
+    const nextMute = !isMuted;
+    setIsMuted(nextMute);
+    isMutedRef.current = nextMute;
+    setChatLog(prev => [
+      ...prev,
+      {
+        sender: "leader",
+        text: nextMute ? "⏸️ Röstsamtalet är tillfälligt pausat (mikrofonen är avstängd)." : "▶️ Röstsamtalet är återupptaget (mikrofonen är på).",
+        timestamp: new Date()
+      }
+    ]);
+  };
 
   useEffect(() => {
     return () => {
@@ -123,11 +139,41 @@ export default function App() {
     if (wsRef.current) return;
     setError("");
 
+    // Reset mute state when starting a fresh session
+    setIsMuted(false);
+    isMutedRef.current = false;
+
     try {
       if (!playerRef.current) {
         playerRef.current = new GaplessPCMPlayer(24000);
       }
       playerRef.current.init();
+
+      // 1. Get microphone access synchronously in direct click event context
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
+      } catch (micErr: any) {
+        console.error("Microphone permission failed:", micErr);
+        setError("Kunde inte starta mikrofonen. Vänligen tillåt mikrofonåtkomst i din webbläsare.");
+        return;
+      }
+
+      // 2. Initialize and resume AudioContext synchronously in click event context
+      let inputAudioCtx: AudioContext;
+      try {
+        inputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+        inputAudioCtxRef.current = inputAudioCtx;
+        if (inputAudioCtx.state === "suspended") {
+          await inputAudioCtx.resume();
+        }
+      } catch (audioCtxErr: any) {
+        console.error("AudioContext initialization failed:", audioCtxErr);
+        setError("Kunde inte starta ljudsystemet.");
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       
@@ -154,15 +200,6 @@ export default function App() {
         }
         
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          streamRef.current = stream;
-
-          const inputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-          inputAudioCtxRef.current = inputAudioCtx;
-          if (inputAudioCtx.state === "suspended") {
-            await inputAudioCtx.resume();
-          }
-
           const source = inputAudioCtx.createMediaStreamSource(stream);
           const processor = inputAudioCtx.createScriptProcessor(4096, 1, 1);
           audioProcessorRef.current = processor;
@@ -171,6 +208,9 @@ export default function App() {
           processor.connect(inputAudioCtx.destination);
 
           processor.onaudioprocess = (e) => {
+            // Respect pause/mute state
+            if (isMutedRef.current) return;
+
             const inputData = e.inputBuffer.getChannelData(0);
             const buffer = new ArrayBuffer(inputData.length * 2);
             const view = new DataView(buffer);
@@ -191,9 +231,9 @@ export default function App() {
               ws.send(JSON.stringify({ audio: base64 }));
             }
           };
-        } catch (micErr: any) {
-          console.error("Microphone permission failed:", micErr);
-          setError("Kunde inte starta mikrofonen. Vänligen tillåt mikrofonåtkomst.");
+        } catch (procErr: any) {
+          console.error("Audio processing setup failed:", procErr);
+          setError("Kunde inte starta röstprocessorn.");
           stopLiveSession();
         }
       };
@@ -395,7 +435,7 @@ export default function App() {
     setChatLog([
       {
         sender: "leader",
-        text: "Hej! Välkommen till H - Tala med handboken. Jag är din röststyrda diskussionsledare drivs av Gemini Live. Klicka på 'STARTA RÖSTSAMTAL' nedan för att börja prata med mig på svenska!",
+        text: "Hej! Välkommen till H - Tala med handboken. Jag är din röststyrda diskussionsledare drivs av Gemini Live. Klicka på den stora knappen 'Ja, Tala med Handboken (starta röstsamtal)' nedan för att börja prata med mig på svenska!",
         timestamp: new Date()
       }
     ]);
@@ -414,7 +454,7 @@ export default function App() {
     } else {
       setChatLog(prev => [...prev, {
         sender: "leader",
-        text: "Klicka på 'STARTA RÖSTSAMTAL' nedan för att starta röststyrningen med Gemini Live och prata eller skriva med mig!",
+        text: "Klicka på den stora knappen 'Ja, Tala med Handboken (starta röstsamtal)' ovan för att starta röststyrningen med Gemini Live och prata eller skriva med mig!",
         timestamp: new Date()
       }]);
     }
@@ -424,9 +464,11 @@ export default function App() {
   const handleStop = () => {
     stopLiveSession();
     setGuideStep(0);
+    setIsMuted(false);
+    isMutedRef.current = false;
     setChatLog([{ 
       sender: "leader", 
-      text: "⏱️ Diskussionsledaren har nollställts. Klicka på 'STARTA RÖSTSAMTAL' nedan för att börja om och prata med mig på svenska!", 
+      text: "⏱️ Diskussionsledaren har nollställts. Klicka på 'Ja, Tala med Handboken (starta röstsamtal)' nedan för att börja om och prata med mig på svenska!", 
       timestamp: new Date() 
     }]);
   };
@@ -690,29 +732,42 @@ export default function App() {
                   initial={{ opacity: 0, scale: 0.95 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.95 }}
-                  className="flex flex-col items-center py-4"
+                  className="flex flex-col items-center py-4 w-full"
                 >
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const txt = "Underbart! Låt oss hämta länkarna till handboken. Klicka på 'HÄMTA LÄNKAR' på skärmen så hämtar jag dem och kopierar automatiskt alla 44 källor till ditt urklipp.";
-                      setGuideStep(1);
-                      setChatLog(prev => [...prev, { sender: "leader", text: txt, timestamp: new Date() }]);
-                      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                        wsRef.current.send(JSON.stringify({ text: `Användaren klickade på startknappen. Vänligen säg detta nu: ${txt}` }));
-                      } else {
-                        startLiveSession(txt);
-                      }
-                    }}
-                    className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3.5 px-6 rounded-xl shadow-lg transition-all text-sm tracking-wide animate-pulse flex items-center justify-center gap-2 active:scale-95"
-                    id="welcome-start-btn"
-                  >
-                    <Sparkles size={16} />
-                    <span>JA, TALA MED HANDBOKEN!</span>
-                  </button>
-                  <p className="text-[10px] text-slate-400 mt-2.5 italic">
-                    Eller säg helt enkelt "Ja" till röstagenten för att börja
-                  </p>
+                  {!liveConnected ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        startLiveSession();
+                      }}
+                      className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 px-6 rounded-2xl shadow-xl transition-all text-xs tracking-wide animate-pulse flex items-center justify-center gap-2 active:scale-95 uppercase"
+                      id="welcome-start-btn"
+                    >
+                      <Sparkles size={16} />
+                      <span>JA, TALA MED HANDBOKEN (STARTA RÖSTSAMTAL)</span>
+                    </button>
+                  ) : (
+                    <div className="w-full space-y-4 text-center">
+                      <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-2xl text-emerald-800 text-xs font-medium space-y-2">
+                        <p className="font-bold text-sm text-emerald-950">🎙️ Röstsamtal är nu igång!</p>
+                        <p className="text-slate-600">Du talar live med diskussionsledaren. Säg hej eller klicka på knappen nedan för att gå till nästa steg.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setGuideStep(1);
+                          const txt = "Härligt! Låt oss hämta länkarna till handboken. Klicka på 'HÄMTA LÄNKAR' på skärmen så hämtar jag dem och kopierar automatiskt alla 44 källor till ditt urklipp.";
+                          setChatLog(prev => [...prev, { sender: "leader", text: txt, timestamp: new Date() }]);
+                          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                            wsRef.current.send(JSON.stringify({ text: `Användaren klickade för att gå vidare till steg 1. Vänligen säg detta nu: ${txt}` }));
+                          }
+                        }}
+                        className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3.5 px-6 rounded-2xl shadow-md text-xs tracking-wider uppercase flex items-center justify-center gap-2 active:scale-95"
+                      >
+                        <span>GÅ TILL HÄMTA LÄNKAR ➔</span>
+                      </button>
+                    </div>
+                  )}
                 </motion.div>
               )}
 
@@ -892,66 +947,98 @@ export default function App() {
                     <span className="text-[9px] text-blue-500 font-bold tracking-widest ml-1 uppercase">H talar...</span>
                   </div>
                 ) : liveConnected ? (
-                  <div className="flex items-center gap-1">
-                    {[...Array(6)].map((_, i) => (
-                      <motion.div
-                        key={i}
-                        className="w-1 bg-emerald-500 rounded-full"
-                        animate={{ height: [6, 18, 6] }}
-                        transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.08, ease: "easeInOut" }}
-                      />
-                    ))}
-                    <span className="text-[9px] text-emerald-500 font-bold tracking-widest ml-1 uppercase animate-pulse">Lyssnar på dig...</span>
-                  </div>
+                  isMuted ? (
+                    <div className="flex items-center gap-1.5 animate-pulse">
+                      <span className="text-[10px] text-amber-500 font-bold uppercase tracking-wide">⏸️ Röstsamtalet är pausat</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1">
+                      {[...Array(6)].map((_, i) => (
+                        <motion.div
+                          key={i}
+                          className="w-1 bg-emerald-500 rounded-full"
+                          animate={{ height: [6, 18, 6] }}
+                          transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.08, ease: "easeInOut" }}
+                        />
+                      ))}
+                      <span className="text-[9px] text-emerald-500 font-bold tracking-widest ml-1 uppercase animate-pulse">Lyssnar på dig...</span>
+                    </div>
+                  )
                 ) : (
-                  <span className="text-[9px] text-slate-300 font-bold tracking-widest uppercase">🎙️ Klicka nedan för att starta röstsamtal med handboken</span>
+                  <span className="text-[9px] text-slate-300 font-bold tracking-widest uppercase">🎙️ Klicka ovan för att starta röstsamtal med handboken</span>
                 )}
               </div>
 
               {/* Robust control buttons */}
               <div className="flex items-center gap-2.5 bg-slate-50 p-2 rounded-xl">
-                
-                {/* Main Start / Stop Live Session Button */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (liveConnected) {
-                      stopLiveSession();
-                    } else {
-                      startLiveSession();
-                    }
-                  }}
-                  className={cn(
-                    "flex-1 py-3 px-4 font-bold rounded-xl text-xs transition-all flex items-center justify-center gap-2 shadow-sm uppercase tracking-wider",
-                    liveConnected
-                      ? "bg-rose-600 hover:bg-rose-700 text-white animate-pulse"
-                      : "bg-blue-600 hover:bg-blue-700 text-white"
-                  )}
-                  id="mic-toggle-btn"
-                >
-                  {liveConnected ? (
-                    <>
-                      <Mic size={14} className="animate-bounce" />
-                      <span>AVSLUTA RÖSTSAMTAL</span>
-                    </>
-                  ) : (
-                    <>
-                      <MicOff size={14} />
-                      <span>STARTA RÖSTSAMTAL</span>
-                    </>
-                  )}
-                </button>
+                {liveConnected ? (
+                  <>
+                    {/* Pausa / Spela Mute Toggle */}
+                    <button
+                      type="button"
+                      onClick={toggleMute}
+                      className={cn(
+                        "flex-1 py-3 px-4 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-sm uppercase tracking-wider",
+                        isMuted 
+                          ? "bg-amber-500 hover:bg-amber-600 text-white" 
+                          : "bg-white border border-slate-200 hover:bg-slate-100 text-slate-700"
+                      )}
+                      id="pause-toggle-btn"
+                    >
+                      {isMuted ? (
+                        <>
+                          <Play size={13} />
+                          <span>Återuppta</span>
+                        </>
+                      ) : (
+                        <>
+                          <Pause size={13} />
+                          <span>Pausa röst</span>
+                        </>
+                      )}
+                    </button>
 
-                {/* STOP/RESET Button */}
-                <button
-                  type="button"
-                  onClick={handleStop}
-                  className="px-4 py-3 bg-white border border-slate-200 hover:bg-slate-100 text-slate-600 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 uppercase tracking-wider"
-                  id="stop-reset-btn"
-                >
-                  <RotateCcw size={13} />
-                  <span>Nollställ</span>
-                </button>
+                    {/* End Call Button */}
+                    <button
+                      type="button"
+                      onClick={stopLiveSession}
+                      className="px-4 py-3 bg-rose-50 hover:bg-rose-100 border border-rose-150 text-rose-700 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 uppercase tracking-wider"
+                      id="stop-call-btn"
+                    >
+                      <MicOff size={13} />
+                      <span>Avsluta</span>
+                    </button>
+
+                    {/* Nollställ Button */}
+                    <button
+                      type="button"
+                      onClick={handleStop}
+                      className="px-4 py-3 bg-white border border-slate-200 hover:bg-slate-100 text-slate-600 rounded-xl text-xs font-bold transition-colors flex items-center gap-1.5 uppercase tracking-wider"
+                      id="stop-reset-btn"
+                    >
+                      <RotateCcw size={13} />
+                      <span>Nollställ</span>
+                    </button>
+                  </>
+                ) : (
+                  /* If not connected, only show start button if we are beyond step 0 */
+                  guideStep > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => startLiveSession()}
+                      className="flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs transition-all flex items-center justify-center gap-2 shadow-sm uppercase tracking-wider"
+                      id="mic-toggle-btn"
+                    >
+                      <Mic size={14} />
+                      <span>Starta röstsamtal</span>
+                    </button>
+                  ) : (
+                    /* On step 0, prompt the user to use the big emerald button above */
+                    <div className="flex-1 py-2 text-center text-slate-400 text-[11px] italic font-medium">
+                      Klicka på den stora knappen ovan för att starta röstsamtalet!
+                    </div>
+                  )
+                )}
               </div>
 
               {/* Text Reply Option (Alternative to voice) */}

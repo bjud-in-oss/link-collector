@@ -114,6 +114,31 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   const isMutedRef = useRef(false);
 
+  // Voice Activity Detection (VAD) state
+  const [vadThreshold, setVadThreshold] = useState(() => {
+    const saved = localStorage.getItem("gemini_vad_threshold");
+    return saved ? parseFloat(saved) : 0.015;
+  });
+  const [silenceThreshold, setSilenceThreshold] = useState(() => {
+    const saved = localStorage.getItem("gemini_silence_threshold");
+    return saved ? parseInt(saved) : 1000;
+  });
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false);
+  const isUserSpeakingRef = useRef(false);
+  const silenceDurationRef = useRef(0);
+  const preSpeechBufferRef = useRef<string[]>([]);
+
+  const vadThresholdRef = useRef(vadThreshold);
+  const silenceThresholdRef = useRef(silenceThreshold);
+
+  useEffect(() => {
+    vadThresholdRef.current = vadThreshold;
+  }, [vadThreshold]);
+
+  useEffect(() => {
+    silenceThresholdRef.current = silenceThreshold;
+  }, [silenceThreshold]);
+
   const toggleMute = () => {
     const nextMute = !isMuted;
     setIsMuted(nextMute);
@@ -145,6 +170,10 @@ export default function App() {
     // Reset mute state when starting a fresh session
     setIsMuted(false);
     isMutedRef.current = false;
+    isUserSpeakingRef.current = false;
+    silenceDurationRef.current = 0;
+    preSpeechBufferRef.current = [];
+    setIsUserSpeaking(false);
 
     try {
       if (!playerRef.current) {
@@ -225,9 +254,27 @@ export default function App() {
 
           processor.onaudioprocess = (e) => {
             // Respect pause/mute state
-            if (isMutedRef.current) return;
+            if (isMutedRef.current) {
+              if (isUserSpeakingRef.current) {
+                isUserSpeakingRef.current = false;
+                setIsUserSpeaking(false);
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ event: "activityEnd" }));
+                }
+              }
+              return;
+            }
 
             const inputData = e.inputBuffer.getChannelData(0);
+            
+            // 1. Calculate RMS (Volume)
+            let sum = 0;
+            for (let i = 0; i < inputData.length; i++) {
+              sum += inputData[i] * inputData[i];
+            }
+            const rms = Math.sqrt(sum / inputData.length);
+
+            // 2. Convert to 16-bit PCM little-endian Base64
             const buffer = new ArrayBuffer(inputData.length * 2);
             const view = new DataView(buffer);
             let offset = 0;
@@ -243,8 +290,63 @@ export default function App() {
             }
             const base64 = window.btoa(binary);
 
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ audio: base64 }));
+            // 3. Client-Side VAD State Machine
+            const isSpeechDetected = rms > vadThresholdRef.current;
+
+            if (isSpeechDetected) {
+              silenceDurationRef.current = 0;
+
+              if (!isUserSpeakingRef.current) {
+                isUserSpeakingRef.current = true;
+                setIsUserSpeaking(true);
+                console.log("[Client VAD] Speech started. Sending activityStart & flushing pre-speech buffer.");
+
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ event: "activityStart" }));
+                  
+                  // Flush pre-speech buffer so initial syllables aren't lost
+                  while (preSpeechBufferRef.current.length > 0) {
+                    const bufferedFrame = preSpeechBufferRef.current.shift();
+                    if (bufferedFrame) {
+                      ws.send(JSON.stringify({ audio: bufferedFrame }));
+                    }
+                  }
+                }
+              }
+
+              // Send active speech audio
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ audio: base64 }));
+              }
+            } else {
+              // Silence detected in current frame
+              if (isUserSpeakingRef.current) {
+                // Keep streaming audio as trailing buffer so sentence endings are complete
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ audio: base64 }));
+                }
+
+                // 4096 samples at 16kHz is exactly 256ms of duration
+                const frameDurationMs = (inputData.length / 16000) * 1000;
+                silenceDurationRef.current += frameDurationMs;
+
+                if (silenceDurationRef.current >= silenceThresholdRef.current) {
+                  isUserSpeakingRef.current = false;
+                  setIsUserSpeaking(false);
+                  console.log(`[Client VAD] Speech ended after ${silenceThresholdRef.current}ms silence. Sending activityEnd.`);
+                  
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ event: "activityEnd" }));
+                  }
+                }
+              } else {
+                // Not speaking: buffer this silent frame as pre-speech
+                preSpeechBufferRef.current.push(base64);
+                // Keep only the last 2 frames (~512ms pre-speech)
+                if (preSpeechBufferRef.current.length > 2) {
+                  preSpeechBufferRef.current.shift();
+                }
+              }
             }
           };
         } catch (procErr: any) {
@@ -1002,11 +1104,21 @@ export default function App() {
                         <motion.div
                           key={i}
                           className="w-1 bg-emerald-500 rounded-full"
-                          animate={{ height: [6, 18, 6] }}
-                          transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.08, ease: "easeInOut" }}
+                          animate={isUserSpeaking ? { height: [6, 22, 6] } : { height: [4, 6, 4] }}
+                          transition={{ 
+                            duration: isUserSpeaking ? 0.4 : 1.2, 
+                            repeat: Infinity, 
+                            delay: i * 0.08, 
+                            ease: "easeInOut" 
+                          }}
                         />
                       ))}
-                      <span className="text-[9px] text-emerald-500 font-bold tracking-widest ml-1 uppercase animate-pulse">Lyssnar på dig...</span>
+                      <span className={cn(
+                        "text-[9px] font-bold tracking-widest ml-1 uppercase transition-all duration-300",
+                        isUserSpeaking ? "text-emerald-600 animate-pulse scale-105" : "text-emerald-500"
+                      )}>
+                        {isUserSpeaking ? "Du talar..." : "Lyssnar på dig..."}
+                      </span>
                     </div>
                   )
                 ) : (
@@ -1211,6 +1323,67 @@ export default function App() {
                   <p className="text-[10px] text-slate-400 leading-normal">
                     Lämna tomt för automatisk anslutning. Vid extern hosting (t.ex. på Netlify) pekar denna automatiskt på din aktiva AI Studio-instans.
                   </p>
+                </div>
+
+                {/* Voice Activity Detection (VAD) Settings */}
+                <div className="space-y-3 pt-3 border-t border-slate-100">
+                  <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
+                    🎙️ Automatisk Röstdetektering (Klient-VAD)
+                  </span>
+
+                  {/* VAD Sensitivity Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-slate-600 font-medium">Röstkänslighet (Känslighetströskel)</span>
+                      <span className="font-mono text-[11px] bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
+                        {vadThreshold.toFixed(3)}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.002"
+                      max="0.08"
+                      step="0.002"
+                      value={vadThreshold}
+                      onChange={(e) => {
+                        const val = parseFloat(e.target.value);
+                        setVadThreshold(val);
+                        localStorage.setItem("gemini_vad_threshold", val.toString());
+                      }}
+                      className="w-full accent-emerald-500 h-1 bg-slate-200 rounded-lg cursor-pointer"
+                    />
+                    <div className="flex justify-between text-[9px] text-slate-400">
+                      <span>Hög känslighet (tyst röst)</span>
+                      <span>Låg känslighet (bullrig miljö)</span>
+                    </div>
+                  </div>
+
+                  {/* Silence Threshold Slider */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between items-center text-xs">
+                      <span className="text-slate-600 font-medium">Pausfördröjning (Tystnadströskel)</span>
+                      <span className="font-mono text-[11px] bg-slate-100 px-1.5 py-0.5 rounded text-slate-700">
+                        {silenceThreshold} ms
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="500"
+                      max="2500"
+                      step="100"
+                      value={silenceThreshold}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value);
+                        setSilenceThreshold(val);
+                        localStorage.setItem("gemini_silence_threshold", val.toString());
+                      }}
+                      className="w-full accent-emerald-500 h-1 bg-slate-200 rounded-lg cursor-pointer"
+                    />
+                    <div className="flex justify-between text-[9px] text-slate-400">
+                      <span>Snabba svar (500ms)</span>
+                      <span>Naturliga pauser (2500ms)</span>
+                    </div>
+                  </div>
                 </div>
 
                 {/* Collapsible raw links preview (Hides clutter by default) */}

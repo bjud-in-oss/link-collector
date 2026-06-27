@@ -251,7 +251,7 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
       });
 
       console.log("Connecting to Gemini Live API...");
-      const session = await liveAi.live.connect({
+      const session = await (liveAi.live.connect as any)({
         model: "gemini-2.0-flash-exp",
         config: {
           responseModalities: ["AUDIO"] as any,
@@ -293,6 +293,11 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
               ]
             }
           ]
+        },
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            disabled: true
+          }
         },
         callbacks: {
           onmessage: async (message: any) => {
@@ -351,13 +356,19 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
         },
       });
 
-      console.log("Gemini Live connected successfully.");
+      console.log("Gemini Live connected successfully with Manual Activity Detection.");
 
       // Receive audio/text/toolResponse from the client and forward to Gemini
       clientWs.on("message", async (data) => {
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.audio) {
+          if (msg.event === "activityStart" && session) {
+            console.log("VAD: activityStart");
+            await session.sendRealtimeInput({ activityStart: {} });
+          } else if (msg.event === "activityEnd" && session) {
+            console.log("VAD: activityEnd");
+            await session.sendRealtimeInput({ activityEnd: {} });
+          } else if (msg.audio) {
             await session.sendRealtimeInput({
               audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
             });

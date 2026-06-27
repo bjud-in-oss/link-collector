@@ -1,6 +1,6 @@
 {
   "name": "H - Tala med handboken",
   "description": "Röststyrd diskussionsledare och länksamling för handboken till Jesu Kristi Kyrka av Sista Dagars Heliga.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

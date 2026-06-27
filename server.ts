@@ -211,17 +211,22 @@ När detta är gjort, förklara hur de kan prata och få bäst svar:
 
 Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara naturligt och led användaren framåt steg för steg. Använd dina verktyg proaktivt när användaren bekräftar ett steg eller ber om det!`;
 
+  console.log("Setting up upgrade listener on server...");
   server.on("upgrade", (request, socket, head) => {
     const { pathname } = new URL(request.url || "", `http://${request.headers.host || "localhost"}`);
+    console.log(`Upgrade request received for path: ${pathname}`);
     if (pathname === "/live-ws") {
+      console.log("Upgrading connection to WebSocket for /live-ws");
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit("connection", ws, request);
       });
+    } else {
+      console.log("Unknown upgrade path, letting other handlers handle it.");
     }
   });
 
   wss.on("connection", async (clientWs, request) => {
-    console.log("Client connected to Gemini Live WS bridge.");
+    console.log("Client connected to Gemini Live WS bridge successfully!");
     
     // Extract API Key from query params or environment
     const { searchParams } = new URL(request.url || "", `http://${request.headers.host || "localhost"}`);
@@ -247,7 +252,7 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
 
       console.log("Connecting to Gemini Live API...");
       const session = await liveAi.live.connect({
-        model: "gemini-3.1-flash-live-preview",
+        model: "gemini-2.0-flash-exp",
         config: {
           responseModalities: ["AUDIO"] as any,
           speechConfig: {
@@ -328,11 +333,20 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
           },
           onclose: () => {
             console.log("Gemini Live session closed internally");
-            clientWs.close();
+            try {
+              clientWs.close();
+            } catch (e) {}
           },
           onerror: (err: any) => {
             console.error("Gemini Live error:", err);
-            clientWs.send(JSON.stringify({ type: "error", error: err.message || "Ett fel uppstod i Gemini Live" }));
+            try {
+              clientWs.send(JSON.stringify({ type: "error", error: err.message || "Ett fel uppstod i Gemini Live" }));
+            } catch (e) {}
+            setTimeout(() => {
+              try {
+                clientWs.close();
+              } catch (e) {}
+            }, 500);
           }
         },
       });
@@ -375,8 +389,14 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
 
     } catch (err: any) {
       console.error("Failed to connect to Gemini Live session:", err);
-      clientWs.send(JSON.stringify({ type: "error", error: `Kunde inte starta Gemini Live-session: ${err.message}` }));
-      clientWs.close();
+      try {
+        clientWs.send(JSON.stringify({ type: "error", error: `Kunde inte starta Gemini Live-session: ${err.message}` }));
+      } catch (e) {}
+      setTimeout(() => {
+        try {
+          clientWs.close();
+        } catch (e) {}
+      }, 500);
     }
   });
 

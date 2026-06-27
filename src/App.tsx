@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Copy, Search, CheckCircle2, ChevronRight, Bot, Volume2, Mic, MicOff, ExternalLink, Settings, X, RotateCcw, Pause, Play, Sparkles } from "lucide-react";
+import { Copy, Search, CheckCircle2, ChevronRight, Bot, Volume2, Mic, MicOff, ExternalLink, Settings, X, RotateCcw, Pause, Play, Sparkles, Loader2 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "./lib/utils";
 
@@ -97,12 +97,14 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showSources, setShowSources] = useState(false);
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("gemini_api_key") || "");
+  const [serverUrl, setServerUrl] = useState(() => localStorage.getItem("gemini_server_url") || "");
   const [error, setError] = useState("");
 
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
   // Gemini Live state
   const [liveConnected, setLiveConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const playerRef = useRef<GaplessPCMPlayer | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -138,6 +140,7 @@ export default function App() {
   const startLiveSession = async (initialText?: string) => {
     if (wsRef.current) return;
     setError("");
+    setIsConnecting(true);
 
     // Reset mute state when starting a fresh session
     setIsMuted(false);
@@ -157,6 +160,7 @@ export default function App() {
       } catch (micErr: any) {
         console.error("Microphone permission failed:", micErr);
         setError("Kunde inte starta mikrofonen. Vänligen tillåt mikrofonåtkomst i din webbläsare.");
+        setIsConnecting(false);
         return;
       }
 
@@ -172,15 +176,26 @@ export default function App() {
         console.error("AudioContext initialization failed:", audioCtxErr);
         setError("Kunde inte starta ljudsystemet.");
         stream.getTracks().forEach(t => t.stop());
+        setIsConnecting(false);
         return;
       }
 
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      let wsUrl = serverUrl.trim();
+      if (!wsUrl) {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        
+        // Netlify & external deploy resiliency: fallback to the live active dev Cloud Run backend!
+        const isExternalHost = !window.location.host.includes(".run.app") && window.location.host !== "localhost:3000";
+        const wsHost = isExternalHost ? "ais-dev-csqchpqaru5ypc2ijmdpbg-52213981999.europe-west2.run.app" : window.location.host;
+        wsUrl = `${protocol}//${wsHost}/live-ws`;
+      }
       
-      // Netlify & external deploy resiliency: fallback to the live Cloud Run backend!
-      const isExternalHost = !window.location.host.includes(".run.app") && window.location.host !== "localhost:3000";
-      const wsHost = isExternalHost ? "ais-pre-csqchpqaru5ypc2ijmdpbg-52213981999.europe-west2.run.app" : window.location.host;
-      const wsUrl = `${protocol}//${wsHost}/live-ws?apiKey=${encodeURIComponent(apiKey)}`;
+      // Safely append the apiKey query parameter
+      if (wsUrl.includes("?")) {
+        wsUrl += `&apiKey=${encodeURIComponent(apiKey)}`;
+      } else {
+        wsUrl += `?apiKey=${encodeURIComponent(apiKey)}`;
+      }
       
       console.log("Connecting to bridge:", wsUrl);
       const ws = new WebSocket(wsUrl);
@@ -189,6 +204,7 @@ export default function App() {
       ws.onopen = async () => {
         setLiveConnected(true);
         setIsListening(true);
+        setIsConnecting(false);
         setError("");
         
         // If there's an initial text instruction, send it immediately upon connection
@@ -364,10 +380,7 @@ export default function App() {
 
       ws.onclose = () => {
         console.log("WebSocket connection closed.");
-        setLiveConnected(false);
-        setIsListening(false);
-        setIsSpeaking(false);
-        wsRef.current = null;
+        stopLiveSession();
       };
 
       ws.onerror = (err) => {
@@ -379,15 +392,17 @@ export default function App() {
     } catch (e: any) {
       console.error("Error setting up Gemini Live:", e);
       setError(`Kunde inte initiera röstanslutning: ${e.message}`);
+      setIsConnecting(false);
     }
   };
 
   const stopLiveSession = () => {
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch (e) {}
+    const ws = wsRef.current;
+    if (ws) {
       wsRef.current = null;
+      try {
+        ws.close();
+      } catch (e) {}
     }
 
     if (streamRef.current) {
@@ -421,6 +436,7 @@ export default function App() {
     setLiveConnected(false);
     setIsListening(false);
     setIsSpeaking(false);
+    setIsConnecting(false);
   };
 
   // Auto scroll to bottom of conversation log
@@ -628,18 +644,21 @@ export default function App() {
           <div className={cn(
             "flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider transition-all",
             isSpeaking ? "bg-blue-50 text-blue-700 border border-blue-100" :
-            liveConnected ? "bg-emerald-50 text-emerald-700 border border-emerald-100 animate-pulse" :
+            liveConnected ? (isMuted ? "bg-amber-50 text-amber-700 border border-amber-100 animate-pulse" : "bg-emerald-50 text-emerald-700 border border-emerald-100 animate-pulse") :
+            isConnecting ? "bg-indigo-50 text-indigo-700 border border-indigo-100 animate-pulse" :
             "bg-slate-50 text-slate-500 border border-slate-100"
           )}>
             <div className={cn(
               "w-1.5 h-1.5 rounded-full",
               isSpeaking ? "bg-blue-500 animate-ping" :
-              liveConnected ? "bg-emerald-500" :
+              liveConnected ? (isMuted ? "bg-amber-500" : "bg-emerald-500") :
+              isConnecting ? "bg-indigo-500 animate-ping" :
               "bg-slate-300"
             )}></div>
             <span>
               {isSpeaking ? "Talar" :
-               liveConnected ? "Lyssnar" :
+               liveConnected ? (isMuted ? "Pausad" : "Lyssnar") :
+               isConnecting ? "Ansluter..." :
                "Vilande"}
             </span>
           </div>
@@ -708,6 +727,23 @@ export default function App() {
           {/* Dynamic Interactive Panel: Shows strictly ONE relevant thing at a time */}
           <div className="p-4 border-t border-slate-150 bg-white flex flex-col gap-3 shrink-0">
             
+            {/* Error display banner */}
+            <AnimatePresence>
+              {error && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: "auto" }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="bg-rose-50 border border-rose-100 text-rose-800 text-xs p-3.5 rounded-xl flex flex-col gap-1.5 shadow-sm"
+                >
+                  <div className="flex items-center gap-2 font-bold text-rose-950">
+                    <span>⚠️ Fel vid röstsamtal</span>
+                  </div>
+                  <p className="text-rose-700 leading-normal">{error}</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
             {/* Copied visual feedback overlay */}
             <AnimatePresence>
               {copied && (
@@ -734,17 +770,26 @@ export default function App() {
                   exit={{ opacity: 0, scale: 0.95 }}
                   className="flex flex-col items-center py-4 w-full"
                 >
-                  {!liveConnected ? (
+                  {isConnecting ? (
+                    <button
+                      type="button"
+                      disabled
+                      className="w-full bg-blue-600/80 text-white font-bold py-4 px-6 rounded-2xl shadow-xl transition-all text-xs tracking-wide flex items-center justify-center gap-2 cursor-wait uppercase"
+                    >
+                      <Loader2 className="animate-spin" size={16} />
+                      <span>Ansluter till röstsamtal...</span>
+                    </button>
+                  ) : !liveConnected ? (
                     <button
                       type="button"
                       onClick={() => {
                         startLiveSession();
                       }}
-                      className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 px-6 rounded-2xl shadow-xl transition-all text-xs tracking-wide animate-pulse flex items-center justify-center gap-2 active:scale-95 uppercase"
+                      className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 px-6 rounded-2xl shadow-xl transition-all text-xs tracking-wide animate-pulse flex items-center justify-center gap-2 active:scale-95"
                       id="welcome-start-btn"
                     >
                       <Sparkles size={16} />
-                      <span>JA, TALA MED HANDBOKEN (STARTA RÖSTSAMTAL)</span>
+                      <span>Ja, Tala med Handboken (starta röstsamtal)</span>
                     </button>
                   ) : (
                     <div className="w-full space-y-4 text-center">
@@ -1023,15 +1068,26 @@ export default function App() {
                 ) : (
                   /* If not connected, only show start button if we are beyond step 0 */
                   guideStep > 0 ? (
-                    <button
-                      type="button"
-                      onClick={() => startLiveSession()}
-                      className="flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs transition-all flex items-center justify-center gap-2 shadow-sm uppercase tracking-wider"
-                      id="mic-toggle-btn"
-                    >
-                      <Mic size={14} />
-                      <span>Starta röstsamtal</span>
-                    </button>
+                    isConnecting ? (
+                      <button
+                        type="button"
+                        disabled
+                        className="flex-1 py-3 px-4 bg-blue-600/80 text-white font-bold rounded-xl text-xs transition-all flex items-center justify-center gap-2 shadow-sm uppercase tracking-wider cursor-wait"
+                      >
+                        <Loader2 className="animate-spin" size={14} />
+                        <span>Ansluter...</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => startLiveSession()}
+                        className="flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs transition-all flex items-center justify-center gap-2 shadow-sm uppercase tracking-wider"
+                        id="mic-toggle-btn"
+                      >
+                        <Mic size={14} />
+                        <span>Starta röstsamtal</span>
+                      </button>
+                    )
                   ) : (
                     /* On step 0, prompt the user to use the big emerald button above */
                     <div className="flex-1 py-2 text-center text-slate-400 text-[11px] italic font-medium">
@@ -1136,6 +1192,27 @@ export default function App() {
                   </p>
                 </div>
 
+                {/* WebSocket Server URL Input */}
+                <div className="space-y-1 pt-1">
+                  <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
+                    Röstserver URL (WebSocket)
+                  </label>
+                  <input
+                    type="text"
+                    value={serverUrl}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setServerUrl(val);
+                      localStorage.setItem("gemini_server_url", val);
+                    }}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/10 text-slate-700"
+                    placeholder="Automatisk detektering (pekar på Cloud Run)"
+                  />
+                  <p className="text-[10px] text-slate-400 leading-normal">
+                    Lämna tomt för automatisk anslutning. Vid extern hosting (t.ex. på Netlify) pekar denna automatiskt på din aktiva AI Studio-instans.
+                  </p>
+                </div>
+
                 {/* Collapsible raw links preview (Hides clutter by default) */}
                 <div className="pt-2 border-t border-slate-100">
                   <button
@@ -1183,7 +1260,9 @@ export default function App() {
                   onClick={() => {
                     setUrl(defaultUrl);
                     setApiKey("");
+                    setServerUrl("");
                     localStorage.removeItem("gemini_api_key");
+                    localStorage.removeItem("gemini_server_url");
                   }}
                   className="text-slate-500 hover:text-slate-700 text-xs font-bold px-3 py-2 transition-colors uppercase tracking-wider"
                   id="reset-settings-btn"

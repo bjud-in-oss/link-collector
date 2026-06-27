@@ -241,9 +241,43 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } }, // Zephyr, Kore, Fenrir, Puck, Charon
           },
           systemInstruction,
+          tools: [
+            {
+              functionDeclarations: [
+                {
+                  name: "goToStep",
+                  description: "Ändra det aktuella steget i guiden. Det finns 5 steg (0 till 4): 0 = Välkommen, 1 = Hämta länkar, 2 = Öppna NotebookLM, 3 = Testa att chatta, 4 = Gemini Live.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      step: {
+                        type: Type.INTEGER,
+                        description: "Stegnumret att gå till (0 till 4)"
+                      }
+                    },
+                    required: ["step"]
+                  }
+                },
+                {
+                  name: "openWebpage",
+                  description: "Öppna en specifik extern webbsida i en ny flik för användaren, till exempel NotebookLM eller Gemini.",
+                  parameters: {
+                    type: Type.OBJECT,
+                    properties: {
+                      url: {
+                        type: Type.STRING,
+                        description: "Den fullständiga URL-adressen att öppna (t.ex. https://notebooklm.google.com/)"
+                      }
+                    },
+                    required: ["url"]
+                  }
+                }
+              ]
+            }
+          ]
         },
         callbacks: {
-          onmessage: (message: any) => {
+          onmessage: async (message: any) => {
             // 1. Send text transcriptions back if available
             if (message.serverContent?.modelTurn?.parts) {
               for (const part of message.serverContent.modelTurn.parts) {
@@ -263,6 +297,21 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
             if (message.serverContent?.interrupted) {
               clientWs.send(JSON.stringify({ type: "interrupted" }));
             }
+
+            // 4. Handle tool/function calls
+            const toolCall = message.toolCall;
+            if (toolCall && toolCall.functionCalls) {
+              for (const call of toolCall.functionCalls) {
+                console.log("Gemini Live Tool Call received from Gemini:", call.name, call.args, call.id);
+                // Forward the tool call to the client WS
+                clientWs.send(JSON.stringify({
+                  type: "toolCall",
+                  name: call.name,
+                  args: call.args,
+                  id: call.id
+                }));
+              }
+            }
           },
           onclose: () => {
             console.log("Gemini Live session closed internally");
@@ -277,7 +326,7 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
 
       console.log("Gemini Live connected successfully.");
 
-      // Receive audio/text from the client and forward to Gemini
+      // Receive audio/text/toolResponse from the client and forward to Gemini
       clientWs.on("message", async (data) => {
         try {
           const msg = JSON.parse(data.toString());
@@ -289,6 +338,16 @@ Håll dina svar korta, extremt trevliga och engagerande på ren svenska. Svara n
             // Send text input if user types
             await session.sendRealtimeInput({
               text: msg.text,
+            });
+          } else if (msg.type === "toolResponse") {
+            console.log("Forwarding tool response to Gemini Live:", msg.id, msg.response);
+            await session.sendToolResponse({
+              functionResponses: [
+                {
+                  response: msg.response,
+                  id: msg.id
+                }
+              ]
             });
           }
         } catch (e: any) {

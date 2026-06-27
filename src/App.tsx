@@ -138,7 +138,12 @@ export default function App() {
       playerRef.current.init();
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/live-ws?apiKey=${encodeURIComponent(apiKey)}`;
+      
+      // Netlify & external deploy resiliency: fallback to the live Cloud Run backend!
+      const isExternalHost = !window.location.host.includes(".run.app") && window.location.host !== "localhost:3000";
+      const wsHost = isExternalHost ? "ais-pre-csqchpqaru5ypc2ijmdpbg-52213981999.europe-west2.run.app" : window.location.host;
+      const wsUrl = `${protocol}//${wsHost}/live-ws?apiKey=${encodeURIComponent(apiKey)}`;
+      
       console.log("Connecting to bridge:", wsUrl);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
@@ -227,6 +232,79 @@ export default function App() {
               playerRef.current.stop();
               playerRef.current = new GaplessPCMPlayer(24000);
               playerRef.current.init();
+            }
+          } else if (msg.type === "toolCall") {
+            console.log("Tool call received from Gemini Live:", msg);
+            if (msg.name === "goToStep") {
+              const targetStep = Number(msg.args.step);
+              if (targetStep >= 0 && targetStep <= 4) {
+                setGuideStep(targetStep);
+                setChatLog((prev) => [
+                  ...prev,
+                  {
+                    sender: "leader",
+                    text: `🔄 Röststyrt kommando: Går till steg ${targetStep}.`,
+                    timestamp: new Date()
+                  }
+                ]);
+                
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "toolResponse",
+                    id: msg.id,
+                    response: { success: true, message: `Successfully changed step to ${targetStep}` }
+                  }));
+                }
+              } else {
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "toolResponse",
+                    id: msg.id,
+                    response: { success: false, error: "Step must be between 0 and 4" }
+                  }));
+                }
+              }
+            } else if (msg.name === "openWebpage") {
+              const url = msg.args.url;
+              try {
+                const opened = window.open(url, "_blank");
+                setChatLog((prev) => [
+                  ...prev,
+                  {
+                    sender: "leader",
+                    text: `🌐 Röststyrt kommando: Öppnar webbsida i ny flik: ${url}`,
+                    timestamp: new Date()
+                  }
+                ]);
+                
+                if (!opened) {
+                  setChatLog((prev) => [
+                    ...prev,
+                    {
+                      sender: "leader",
+                      text: `⚠️ Popup-blockerare hindrade sidan från att öppnas. Klicka här för att öppna den manuellt: ${url}`,
+                      timestamp: new Date()
+                    }
+                  ]);
+                }
+                
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "toolResponse",
+                    id: msg.id,
+                    response: { success: true, opened: !!opened }
+                  }));
+                }
+              } catch (err: any) {
+                console.error("Failed to open webpage via tool:", err);
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "toolResponse",
+                    id: msg.id,
+                    response: { success: false, error: err.message }
+                  }));
+                }
+              }
             }
           }
         } catch (err) {
@@ -586,8 +664,12 @@ export default function App() {
     let links: BasicLink[] = [];
     
     try {
+      // Netlify & external deploy resiliency: fallback to the live Cloud Run backend API!
+      const isExternalHost = !window.location.host.includes(".run.app") && window.location.host !== "localhost:3000";
+      const apiBase = isExternalHost ? "https://ais-pre-csqchpqaru5ypc2ijmdpbg-52213981999.europe-west2.run.app" : "";
+
       // 1. Attempt local Node/Express scraper proxy first
-      const response = await fetch("/api/extract-links", {
+      const response = await fetch(`${apiBase}/api/extract-links`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: scanUrl }),

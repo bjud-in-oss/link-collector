@@ -10,6 +10,73 @@ interface BasicLink {
 
 const defaultUrl = "https://www.churchofjesuschrist.org/study/manual/general-handbook?lang=eng";
 
+class GaplessPCMPlayer {
+  private audioCtx: AudioContext | null = null;
+  private nextStartTime: number = 0;
+  private sampleRate: number = 24000;
+
+  constructor(sampleRate = 24000) {
+    this.sampleRate = sampleRate;
+  }
+
+  init() {
+    if (!this.audioCtx) {
+      this.audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: this.sampleRate,
+      });
+      this.nextStartTime = this.audioCtx.currentTime;
+    }
+    if (this.audioCtx.state === "suspended") {
+      this.audioCtx.resume();
+    }
+  }
+
+  playChunk(base64Data: string) {
+    this.init();
+    if (!this.audioCtx) return;
+
+    // Decode base64 to Uint8Array
+    const binary = window.atob(base64Data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    // Convert 16-bit PCM (little-endian) to float32
+    const int16Array = new Int16Array(bytes.buffer);
+    const float32Array = new Float32Array(int16Array.length);
+    for (let i = 0; i < int16Array.length; i++) {
+      float32Array[i] = int16Array[i] / 32768;
+    }
+
+    // Create an AudioBuffer
+    const audioBuffer = this.audioCtx.createBuffer(1, float32Array.length, this.sampleRate);
+    audioBuffer.getChannelData(0).set(float32Array);
+
+    // Schedule playback
+    const source = this.audioCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(this.audioCtx.destination);
+
+    const currentTime = this.audioCtx.currentTime;
+    if (this.nextStartTime < currentTime) {
+      this.nextStartTime = currentTime + 0.05; // small buffer
+    }
+
+    source.start(this.nextStartTime);
+    this.nextStartTime += audioBuffer.duration;
+  }
+
+  stop() {
+    if (this.audioCtx) {
+      try {
+        this.audioCtx.close();
+      } catch (e) {}
+      this.audioCtx = null;
+    }
+  }
+}
+
 export default function App() {
   const [url, setUrl] = useState(defaultUrl);
   
@@ -36,6 +103,198 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<any>(null);
 
+  // Gemini Live state
+  const [voiceMode, setVoiceMode] = useState<"live" | "local">(() => {
+    return (localStorage.getItem("voice_mode") as "live" | "local") || "live";
+  });
+  const [liveConnected, setLiveConnected] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const playerRef = useRef<GaplessPCMPlayer | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const inputAudioCtxRef = useRef<AudioContext | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem("voice_mode", voiceMode);
+    if (voiceMode !== "live") {
+      stopLiveSession();
+    }
+  }, [voiceMode]);
+
+  useEffect(() => {
+    return () => {
+      stopLiveSession();
+    };
+  }, []);
+
+  const startLiveSession = async () => {
+    if (wsRef.current) return;
+    setError("");
+
+    try {
+      if (!playerRef.current) {
+        playerRef.current = new GaplessPCMPlayer(24000);
+      }
+      playerRef.current.init();
+
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.host}/live-ws?apiKey=${encodeURIComponent(apiKey)}`;
+      console.log("Connecting to bridge:", wsUrl);
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = async () => {
+        setLiveConnected(true);
+        setIsListening(true);
+        setError("");
+        
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          streamRef.current = stream;
+
+          const inputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+          inputAudioCtxRef.current = inputAudioCtx;
+
+          const source = inputAudioCtx.createMediaStreamSource(stream);
+          const processor = inputAudioCtx.createScriptProcessor(4096, 1, 1);
+          audioProcessorRef.current = processor;
+
+          source.connect(processor);
+          processor.connect(inputAudioCtx.destination);
+
+          processor.onaudioprocess = (e) => {
+            const inputData = e.inputBuffer.getChannelData(0);
+            const buffer = new ArrayBuffer(inputData.length * 2);
+            const view = new DataView(buffer);
+            let offset = 0;
+            for (let i = 0; i < inputData.length; i++, offset += 2) {
+              let s = Math.max(-1, Math.min(1, inputData[i]));
+              view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+            }
+
+            let binary = "";
+            const bytes = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.byteLength; i++) {
+              binary += String.fromCharCode(bytes[i]);
+            }
+            const base64 = window.btoa(binary);
+
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ audio: base64 }));
+            }
+          };
+        } catch (micErr: any) {
+          console.error("Microphone permission failed:", micErr);
+          setError("Kunde inte starta mikrofonen. Vänligen tillåt mikrofonåtkomst.");
+          stopLiveSession();
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          
+          if (msg.type === "error") {
+            setError(msg.error);
+            stopLiveSession();
+          } else if (msg.type === "audio") {
+            setIsSpeaking(true);
+            if (playerRef.current) {
+              playerRef.current.playChunk(msg.audio);
+            }
+          } else if (msg.type === "text") {
+            // Append streaming words to the chat log dynamically!
+            setChatLog((prev) => {
+              if (prev.length === 0) {
+                return [{ sender: "leader", text: msg.text, timestamp: new Date() }];
+              }
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg.sender === "leader") {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  ...lastMsg,
+                  text: lastMsg.text + msg.text,
+                };
+                return updated;
+              } else {
+                return [...prev, { sender: "leader", text: msg.text, timestamp: new Date() }];
+              }
+            });
+          } else if (msg.type === "interrupted") {
+            console.log("Interruption received from Gemini Live!");
+            setIsSpeaking(false);
+            if (playerRef.current) {
+              playerRef.current.stop();
+              playerRef.current = new GaplessPCMPlayer(24000);
+              playerRef.current.init();
+            }
+          }
+        } catch (err) {
+          console.error("Failed to parse message from Live WS:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        console.log("WebSocket connection closed.");
+        setLiveConnected(false);
+        setIsListening(false);
+        setIsSpeaking(false);
+        wsRef.current = null;
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        setError("Kunde inte ansluta till Gemini Live. Kontrollera din internetanslutning eller API-nyckel.");
+        stopLiveSession();
+      };
+
+    } catch (e: any) {
+      console.error("Error setting up Gemini Live:", e);
+      setError(`Kunde inte initiera röstanslutning: ${e.message}`);
+    }
+  };
+
+  const stopLiveSession = () => {
+    if (wsRef.current) {
+      try {
+        wsRef.current.close();
+      } catch (e) {}
+      wsRef.current = null;
+    }
+
+    if (streamRef.current) {
+      try {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+      } catch (e) {}
+      streamRef.current = null;
+    }
+
+    if (audioProcessorRef.current) {
+      try {
+        audioProcessorRef.current.disconnect();
+      } catch (e) {}
+      audioProcessorRef.current = null;
+    }
+
+    if (inputAudioCtxRef.current) {
+      try {
+        inputAudioCtxRef.current.close();
+      } catch (e) {}
+      inputAudioCtxRef.current = null;
+    }
+
+    if (playerRef.current) {
+      try {
+        playerRef.current.stop();
+      } catch (e) {}
+      playerRef.current = null;
+    }
+
+    setLiveConnected(false);
+    setIsListening(false);
+    setIsSpeaking(false);
+  };
+
   // Auto scroll to bottom of conversation log
   useEffect(() => {
     if (chatEndRef.current) {
@@ -50,7 +309,11 @@ export default function App() {
     const triggerInitialGreeting = () => {
       if (guideStep === 0 && chatLog.length === 0 && !isPaused) {
         setChatLog([{ sender: "leader", text: welcomeMsg, timestamp: new Date() }]);
-        speakStep(0, welcomeMsg);
+        if (voiceMode === "live") {
+          startLiveSession();
+        } else {
+          speakStep(0, welcomeMsg);
+        }
       }
       // Remove listeners so they only run once
       window.removeEventListener("click", triggerInitialGreeting);
@@ -64,7 +327,11 @@ export default function App() {
     const timer = setTimeout(() => {
       if (guideStep === 0 && chatLog.length === 0 && !isPaused) {
         setChatLog([{ sender: "leader", text: welcomeMsg, timestamp: new Date() }]);
-        speakStep(0, welcomeMsg);
+        if (voiceMode === "live") {
+          startLiveSession();
+        } else {
+          speakStep(0, welcomeMsg);
+        }
       }
     }, 1500);
 
@@ -73,7 +340,7 @@ export default function App() {
       window.removeEventListener("touchstart", triggerInitialGreeting);
       clearTimeout(timer);
     };
-  }, []);
+  }, [voiceMode]);
 
   // Web Speech API: Speech Recognition
   const startVoiceListening = () => {
@@ -132,20 +399,27 @@ export default function App() {
 
   // Web Speech API: Speech Synthesis (TTS) with Swedish locale
   const speakStep = (stepNum: number, overrideText?: string) => {
+    const textToSpeak = overrideText || (
+      stepNum === 0 ? "Hej! Välkommen till H - Tala med handboken. Jag är din röststyrda diskussionsledare drivs av Gemini Live. Vill du prata med Handboken för Jesu Kristi Kyrka av Sista Dagars heliga?" :
+      stepNum === 1 ? "Härligt! Låt oss hämta länkarna till handboken. Klicka på 'HÄMTA LÄNKAR' på skärmen så hämtar jag dem och kopierar automatiskt alla 44 källor till ditt urklipp." :
+      stepNum === 2 ? "Underbart! Jag har hämtat alla 44 källor och kopierat dem till ditt urklipp automatiskt. Klicka på '2. ÖPPNA NOTEBOOKLM' för att öppna verktyget, klicka på 'Skapa ny notebook' (eller 'Create new notebook') och klistra in alla länkarna i fältet för webbplats. Säg till mig när du har gjort det, så går vi vidare!" :
+      stepNum === 3 ? "Toppen! Nu är din handbok laddad i NotebookLM. Prova gärna att chatta i fältet nere till höger, till exempel 'Vad säger handboken om stöd till familjer?'. Berätta för mig hur det gick när du är klar!" :
+      stepNum === 4 ? "Fantastiskt! Nu ska vi koppla ihop handboken med Gemini. Innan du trycker på mikrofonen i Gemini, klicka på plustecknet till vänster om chattrutan, välj 'Fler uppladdningar' och klicka på 'Notebooks'. Välj den översta anteckningsboken i listan och klicka på 'infoga'. Nu kan du prata direkt med handboken! För bästa och mest detaljerade svar, använd mikrofonsymbolen för att turas om att prata, eller skriv i chatten. Om du vill ha en mer naturlig och snabb dialog, klicka på Live-symbolen för en röstchatt – men tänk på att svaren då blir lite mindre detaljerade!" : ""
+    );
+
+    if (voiceMode === "live") {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && textToSpeak) {
+        wsRef.current.send(JSON.stringify({ text: `Vänligen säg eller vägled användaren genom detta steg nu: ${textToSpeak}` }));
+      }
+      return;
+    }
+
     if (!('speechSynthesis' in window)) return;
     if (isPaused) return;
     
     // Always abort active listening before speaking to prevent self-echo feedback
     stopVoiceListening();
     window.speechSynthesis.cancel();
-    
-    const textToSpeak = overrideText || (
-      stepNum === 0 ? "Välkommen till H. Vill du prata med Handboken för Jesu Kristi Kyrka av Sista Dagars heliga?" :
-      stepNum === 1 ? "Härligt! Låt oss hämta länkarna till handboken. Klicka på 'HÄMTA LÄNKAR' på skärmen så hämtar jag dem och kopierar automatiskt alla 44 källor till ditt urklipp." :
-      stepNum === 2 ? "Underbart! Jag har hämtat alla 44 källor och kopierat dem till ditt urklipp automatiskt. Klicka på '2. ÖPPNA NOTEBOOKLM' för att öppna verktyget, klicka på 'Skapa ny notebook' och klistra in alla länkarna i webbplatsfältet. Säg till mig när du har gjort det, så går vi vidare!" :
-      stepNum === 3 ? "Toppen! Nu är din handbok laddad i NotebookLM. Prova gärna att chatta i fältet nere till höger, till exempel 'Vad säger handboken om stöd till familjer?'. Berätta för mig hur det gick när du är klar!" :
-      stepNum === 4 ? "Fantastiskt! Nu är vi redo för det sista steget: röstsamtal direkt med handboken i Gemini Live på svenska. Klicka på '4. ÖPPNA GEMINI LIVE' och tryck på mikrofonsymbolen. Ha ett givande samtal!" : ""
-    );
     
     if (!textToSpeak) return;
 
@@ -252,8 +526,12 @@ export default function App() {
 
   // PAUS action
   const handlePause = () => {
-    window.speechSynthesis.cancel();
-    stopVoiceListening();
+    if (voiceMode === "live") {
+      stopLiveSession();
+    } else {
+      window.speechSynthesis.cancel();
+      stopVoiceListening();
+    }
     setIsPaused(true);
     setIsSpeaking(false);
     setChatLog(prev => [...prev, { sender: "leader", text: "⏸️ Röstagenten har pausats.", timestamp: new Date() }]);
@@ -263,14 +541,22 @@ export default function App() {
   const handleResume = () => {
     setIsPaused(false);
     setTimeout(() => {
-      speakStep(guideStep);
+      if (voiceMode === "live") {
+        startLiveSession();
+      } else {
+        speakStep(guideStep);
+      }
     }, 300);
   };
 
   // STOP (Reset) action
   const handleStop = () => {
-    window.speechSynthesis.cancel();
-    stopVoiceListening();
+    if (voiceMode === "live") {
+      stopLiveSession();
+    } else {
+      window.speechSynthesis.cancel();
+      stopVoiceListening();
+    }
     setGuideStep(0);
     setIsSpeaking(false);
     setIsPaused(false);
@@ -280,7 +566,11 @@ export default function App() {
       timestamp: new Date() 
     }]);
     setTimeout(() => {
-      speakStep(0, "Diskussionsledaren har nollställts. Vill du starta om?");
+      if (voiceMode === "live") {
+        startLiveSession();
+      } else {
+        speakStep(0, "Diskussionsledaren har nollställts. Vill du starta om?");
+      }
     }, 400);
   };
 
@@ -644,7 +934,7 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setGuideStep(4);
-                      const txt = "Toppen! Nu öppnar vi Gemini så att du kan börja prata med handboken med Gemini Live på svenska. Tryck på mikrofonsymbolen längst ner till höger i Gemini för att prata direkt med röst (mikrofonen ger bäst resultat).";
+                      const txt = "Fantastiskt! Nu ska vi koppla ihop handboken med Gemini. Innan du trycker på mikrofonen i Gemini, klicka på plustecknet till vänster om chattrutan, välj 'Fler uppladdningar' och klicka på 'Notebooks'. Välj den översta anteckningsboken i listan och klicka på 'infoga'. Nu kan du prata direkt med handboken! För bästa och mest detaljerade svar, använd mikrofonsymbolen för att turas om att prata, eller skriv i chatten. Om du vill ha en mer naturlig och snabb dialog, klicka på Live-symbolen för en röstchatt – men tänk på att svaren då blir lite mindre detaljerade!";
                       setChatLog(prev => [...prev, { sender: "leader", text: txt, timestamp: new Date() }]);
                       speakStep(4, txt);
                     }}
@@ -667,8 +957,24 @@ export default function App() {
                   initial={{ opacity: 0, scale: 0.95 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.95 }}
-                  className="flex flex-col gap-2.5"
+                  className="flex flex-col gap-3"
                 >
+                  <div className="bg-blue-50/50 border border-blue-100 rounded-xl p-3.5 text-slate-700 text-xs space-y-2 leading-relaxed">
+                    <p className="font-bold text-blue-800">Följ dessa exakta instruktioner i Gemini:</p>
+                    <ol className="list-decimal list-inside space-y-1 text-slate-600 pl-1">
+                      <li>Öppna Gemini genom knappen nedan.</li>
+                      <li>Klicka på <strong className="text-slate-800 font-bold">+ knappen</strong> till vänster om chattrutan.</li>
+                      <li>Välj menyvalet <strong className="text-slate-800 font-bold">"Fler uppladdningar"</strong> och sedan <strong className="text-slate-800 font-bold">"Notebooks"</strong>.</li>
+                      <li>Välj den <strong className="text-slate-800 font-bold">översta anteckningsboken</strong> i listan och klicka på <strong className="text-slate-800 font-bold">"infoga"</strong>.</li>
+                    </ol>
+                    <p className="text-[11px] pt-1 border-t border-blue-100/60 mt-2 text-slate-500">
+                      🎤 <strong>Turas om att prata:</strong> Klicka på mikrofonsymbolen i Gemini för mest detaljerade svar.
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                      ⚡ <strong>Live röstchatt:</strong> Klicka på Live-symbolen för naturlig dialog men mindre detaljerade svar.
+                    </p>
+                  </div>
+
                   <a
                     href="https://gemini.google.com"
                     target="_blank"
@@ -677,7 +983,7 @@ export default function App() {
                     id="open-gemini-btn"
                   >
                     <Bot size={14} />
-                    <span>4. ÖPPNA GEMINI LIVE (TALA PÅ SVENSKA)</span>
+                    <span>4. ÖPPNA GEMINI</span>
                   </a>
 
                   <button
@@ -697,6 +1003,37 @@ export default function App() {
             {/* Custom Reply & Voice Controls */}
             <div className="pt-2 border-t border-slate-100 flex flex-col gap-2.5">
               
+              {/* Voice Mode Selector */}
+              <div className="flex items-center justify-between bg-slate-50 border border-slate-100/60 p-1.5 rounded-xl text-[11px]">
+                <span className="text-slate-500 font-bold uppercase tracking-wider pl-1.5">Röstagent:</span>
+                <div className="flex gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setVoiceMode("live")}
+                    className={cn(
+                      "px-2.5 py-1 rounded-lg font-bold transition-all text-[10px]",
+                      voiceMode === "live"
+                        ? "bg-blue-600 text-white shadow-sm"
+                        : "bg-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-200"
+                    )}
+                  >
+                    🎙️ Gemini Live
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setVoiceMode("local")}
+                    className={cn(
+                      "px-2.5 py-1 rounded-lg font-bold transition-all text-[10px]",
+                      voiceMode === "local"
+                        ? "bg-slate-700 text-white shadow-sm"
+                        : "bg-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-200"
+                    )}
+                  >
+                    🗣️ Web Speech (TTS)
+                  </button>
+                </div>
+              </div>
+
               {/* Dynamic Interactive voice animation waves */}
               <div className="flex items-center justify-center h-8 relative">
                 {isSpeaking ? (
@@ -709,9 +1046,9 @@ export default function App() {
                         transition={{ duration: 0.8, repeat: Infinity, delay: i * 0.12, ease: "easeInOut" }}
                       />
                     ))}
-                    <span className="text-[9px] text-blue-500 font-bold tracking-widest ml-1 uppercase">Talar</span>
+                    <span className="text-[9px] text-blue-500 font-bold tracking-widest ml-1 uppercase">H talar</span>
                   </div>
-                ) : isListening ? (
+                ) : (voiceMode === "live" ? liveConnected : isListening) ? (
                   <div className="flex items-center gap-1">
                     {[...Array(6)].map((_, i) => (
                       <motion.div
@@ -726,7 +1063,7 @@ export default function App() {
                 ) : isPaused ? (
                   <span className="text-[9px] text-amber-500 font-bold tracking-widest uppercase">⏸️ Pausad</span>
                 ) : (
-                  <span className="text-[9px] text-slate-300 font-bold tracking-widest uppercase">🎙️ Redo för röstkommando</span>
+                  <span className="text-[9px] text-slate-300 font-bold tracking-widest uppercase">🎙️ Klicka för att prata</span>
                 )}
               </div>
 
@@ -737,22 +1074,30 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => {
-                    if (isListening) {
-                      stopVoiceListening();
+                    if (voiceMode === "live") {
+                      if (liveConnected) {
+                        stopLiveSession();
+                      } else {
+                        startLiveSession();
+                      }
                     } else {
-                      startVoiceListening();
+                      if (isListening) {
+                        stopVoiceListening();
+                      } else {
+                        startVoiceListening();
+                      }
                     }
                   }}
                   className={cn(
                     "p-2.5 rounded-full transition-all duration-200 flex items-center justify-center",
-                    isListening 
+                    (voiceMode === "live" ? liveConnected : isListening)
                       ? "bg-emerald-500 text-white shadow-md scale-105" 
                       : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-100"
                   )}
-                  title={isListening ? "Stäng av mikrofon" : "Slå på mikrofon (Prata)"}
+                  title={(voiceMode === "live" ? liveConnected : isListening) ? "Stäng av röstsession" : "Starta röstsession (Prata)"}
                   id="mic-toggle-btn"
                 >
-                  {isListening ? <Mic size={16} /> : <MicOff size={16} />}
+                  {(voiceMode === "live" ? liveConnected : isListening) ? <Mic size={16} /> : <MicOff size={16} />}
                 </button>
 
                 {/* PAUS Button */}

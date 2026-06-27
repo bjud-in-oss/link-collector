@@ -127,7 +127,7 @@ export default function App() {
     };
   }, []);
 
-  const startLiveSession = async () => {
+  const startLiveSession = async (initialText?: string) => {
     if (wsRef.current) return;
     setError("");
 
@@ -152,6 +152,11 @@ export default function App() {
         setLiveConnected(true);
         setIsListening(true);
         setError("");
+        
+        // If there's an initial text instruction, send it immediately upon connection
+        if (initialText) {
+          ws.send(JSON.stringify({ text: `Vänligen säg eller vägled användaren genom detta steg nu: ${initialText}` }));
+        }
         
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -387,11 +392,7 @@ export default function App() {
     const triggerInitialGreeting = () => {
       if (guideStep === 0 && chatLog.length === 0 && !isPaused) {
         setChatLog([{ sender: "leader", text: welcomeMsg, timestamp: new Date() }]);
-        if (voiceMode === "live") {
-          startLiveSession();
-        } else {
-          speakStep(0, welcomeMsg);
-        }
+        speakStep(0, welcomeMsg);
       }
       // Remove listeners so they only run once
       window.removeEventListener("click", triggerInitialGreeting);
@@ -405,11 +406,7 @@ export default function App() {
     const timer = setTimeout(() => {
       if (guideStep === 0 && chatLog.length === 0 && !isPaused) {
         setChatLog([{ sender: "leader", text: welcomeMsg, timestamp: new Date() }]);
-        if (voiceMode === "live") {
-          startLiveSession();
-        } else {
-          speakStep(0, welcomeMsg);
-        }
+        speakStep(0, welcomeMsg);
       }
     }, 1500);
 
@@ -915,10 +912,14 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => {
-                      setGuideStep(1);
                       const txt = "Underbart! Låt oss hämta länkarna till handboken. Klicka på 'HÄMTA LÄNKAR' på skärmen så hämtar jag dem och kopierar automatiskt alla 44 källor till ditt urklipp.";
+                      if (voiceMode === "live") {
+                        startLiveSession(txt);
+                      } else {
+                        speakStep(1, txt);
+                      }
+                      setGuideStep(1);
                       setChatLog(prev => [...prev, { sender: "leader", text: txt, timestamp: new Date() }]);
-                      speakStep(1, txt);
                     }}
                     className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3.5 px-6 rounded-xl shadow-lg transition-all text-sm tracking-wide animate-pulse flex items-center justify-center gap-2 active:scale-95"
                     id="welcome-start-btn"

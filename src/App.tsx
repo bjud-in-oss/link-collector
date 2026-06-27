@@ -164,6 +164,9 @@ export default function App() {
 
           const inputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
           inputAudioCtxRef.current = inputAudioCtx;
+          if (inputAudioCtx.state === "suspended") {
+            await inputAudioCtx.resume();
+          }
 
           const source = inputAudioCtx.createMediaStreamSource(stream);
           const processor = inputAudioCtx.createScriptProcessor(4096, 1, 1);
@@ -1092,7 +1095,14 @@ export default function App() {
                 <div className="flex gap-1">
                   <button
                     type="button"
-                    onClick={() => setVoiceMode("live")}
+                    onClick={() => {
+                      setVoiceMode("live");
+                      localStorage.setItem("voice_mode", "live");
+                      stopVoiceListening();
+                      if (typeof window !== "undefined" && window.speechSynthesis) {
+                        window.speechSynthesis.cancel();
+                      }
+                    }}
                     className={cn(
                       "px-2.5 py-1 rounded-lg font-bold transition-all text-[10px]",
                       voiceMode === "live"
@@ -1104,7 +1114,11 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setVoiceMode("local")}
+                    onClick={() => {
+                      setVoiceMode("local");
+                      localStorage.setItem("voice_mode", "local");
+                      stopLiveSession();
+                    }}
                     className={cn(
                       "px-2.5 py-1 rounded-lg font-bold transition-all text-[10px]",
                       voiceMode === "local"
